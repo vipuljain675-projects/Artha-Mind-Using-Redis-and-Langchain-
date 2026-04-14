@@ -84,6 +84,34 @@ The system is decoupled to emulate a real-world microservices environment.
 
 ---
 
+## 📦 Core Dependencies & Packages
+
+### 🌐 The Web & UI Layer
+* **`streamlit`** — Framework that turns Python scripts into interactive web apps instantly. Renders the UI, chat bar, and layout.
+* **`plotly`** — Graphing library for interactive data visualizations used to build radial gauge charts on the dashboard.
+
+### 🧠 The Core AI & Logic Layer
+* **`langchain`** — Master framework that chains memory, prompt templates, logic, and models together.
+* **`langchain-groq`** — Bridge implementation allowing LangChain to natively format requests for Groq's ultra-fast Llama 3.1 APIs.
+* **`langchain-community`** — Ecosystem tools used here specifically to access `PyPDFLoader` to parse textual data out of PDF files.
+
+### 📚 The Data & Text Processing Layer
+* **`pypdf`** — Pure python library working behind the scenes to read, parse, and split PDF documents.
+* **`sentence-transformers`** — Specialized ML models capable of turning words and sentences into vast arrays of mathematical vectors representing semantic definition.
+* **`faiss-cpu`** — Facebook AI Similarity Search. An insanely fast local vector database that holds mathematical embeddings and performs nearest-neighbor vector searches in milliseconds.
+
+### 🧰 Backend Utilities
+* **`python-dotenv`** — Security standard practice that looks for the hidden `.env` file to load your API key into scripts without hardcoding it.
+* **`pandas` & `numpy`** — Mathematical data wrangling used for managing matrices beneath Plotly charts and FAISS vectorization.
+* **`pydantic`** — Data validation library enforcing strict rules ensuring the AI continuously outputs predictable, perfectly formatted JSON.
+
+### 🚀 The Async Infrastructure Layer
+* **`redis`** — The Python driver connecting your scripts to your Dockerized Redis message queue broker.
+* **`rq`** (Redis Queue) — A lightweight job queueing system built on Redis. Powers the background `SimpleWorker` to quietly analyze massive PDFs without blocking the UI.
+* **`fpdf`** — Allows programmatic generation of formatted PDF files (used to generate synthetic annual reports).
+
+---
+
 ## 🚀 Quick Start Guide
 
 ### 1. Prerequisites
