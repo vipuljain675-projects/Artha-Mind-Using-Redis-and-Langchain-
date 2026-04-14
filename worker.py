@@ -15,46 +15,58 @@ from langchain_community.document_loaders import PyPDFLoader
 from chain import extract_kpis_with_llm
 
 
-def async_ingest_and_extract(file_path: str, filename: str, api_key: str) -> dict:
+def async_ingest_and_extract(files: list, api_key: str) -> dict:
     """
     Background job to process massive PDFs without blocking the UI.
-    Steps:
-    1. Load PDF from disk path
-    2. Chunk into semantic pieces
-    3. Build & save FAISS vector store to disk
-    4. Call Groq LLM to extract financial KPIs
-    5. Return structured results dict (stored in Redis by rq)
+    Accepts a list of files to support Multi-Document RAG.
     """
     try:
-        # 1. Load PDF
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-        for doc in docs:
-            doc.metadata["source_file"] = filename
+        all_chunks = []
+        multi_kpis = {}
+        total_pages = 0
 
-        # 2. Chunk & build vector DB
-        chunks = chunk_documents(docs)
-        build_vector_store(chunks, store_name="financial_index")
+        for file_info in files:
+            file_path = file_info["file_path"]
+            filename = file_info["filename"]
 
-        # 3. Extract KPIs using first ~15 pages (covers balance sheet in longer reports)
-        raw_text = "\n".join([d.page_content for d in docs[:15]])
-        kpis = extract_kpis_with_llm(raw_text, api_key)
+            # 1. Load PDF
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata["source_file"] = filename
+            
+            total_pages += len(docs)
 
-        # 4. Clean up temp file
-        if os.path.exists(file_path):
-            os.remove(file_path)
+            # 2. Chunk
+            chunks = chunk_documents(docs)
+            all_chunks.extend(chunks)
+
+            # 3. Extract KPIs for this specific document
+            raw_text = "\n".join([d.page_content for d in docs[:15]])
+            kpis = extract_kpis_with_llm(raw_text, api_key)
+            multi_kpis[filename] = kpis
+
+            # 4. Clean up temp file
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        # 5. Build/Append to vector DB using all chunks combined
+        if all_chunks:
+            build_vector_store(all_chunks, store_name="financial_index")
 
         return {
             "status": "success",
-            "filename": filename,
-            "total_pages": len(docs),
-            "total_chunks": len(chunks),
-            "kpis": kpis,
+            "filenames": [f["filename"] for f in files],
+            "total_pages": total_pages,
+            "total_chunks": len(all_chunks),
+            "kpis": multi_kpis,
         }
 
     except Exception as e:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Cleanup on failure
+        for file_info in files:
+            if os.path.exists(file_info["file_path"]):
+                os.remove(file_info["file_path"])
         return {"status": "error", "error": str(e)}
 
 

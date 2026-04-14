@@ -30,59 +30,92 @@ def build_llm(api_key: str, model: str = "llama-3.1-8b-instant", temperature: fl
     )
 
 
-def build_qa_chain(
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.tools import tool
+from prompts import AGENT_SYSTEM_PROMPT
+
+
+@tool
+def live_stock_price(ticker: str) -> str:
+    """Fetch live stock price and key statistics for a given stock ticker (e.g. AAPL, MSFT, RELIANCE.NS)."""
+    import yfinance as yf
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        price = info.get('currentPrice', 'N/A')
+        pe = info.get('trailingPE', 'N/A')
+        market_cap = info.get('marketCap', 'N/A')
+        return f"Live Data for {ticker}:\nPrice: {price}\nTrailing P/E: {pe}\nMarket Cap: {market_cap}"
+    except Exception as e:
+        return f"Error fetching stock data for {ticker}. Ensure ticker is correct."
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web for news or recent events to get unstructured current context."""
+    from duckduckgo_search import DDGS
+    try:
+        results = DDGS().text(query, max_results=3)
+        return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+    except Exception as e:
+        return f"Error searching the web: {e}"
+
+def get_document_search_tool(vectorstore: FAISS):
+    @tool
+    def financial_document_search(query: str) -> str:
+        """Search the uploaded financial reports (Annual reports, 10-K, earnings) for key metrics and commentary.
+        CRITICAL: Pass short, targeted keywords (e.g. "EPS" or "Earnings Per Share") as the query rather than full sentences for best results!"""
+        retriever = vectorstore.as_retriever(
+            search_type="mmr", 
+            search_kwargs={"k": 10, "fetch_k": 30, "lambda_mult": 0.7}
+        )
+        docs = retriever.invoke(query)
+        if not docs:
+            return "No relevant information found in the uploaded documents. Try searching with different keywords."
+        return "\n\n".join([f"Source (File: {d.metadata.get('source_file', '?')}): {d.page_content}" for d in docs])
+    return financial_document_search
+
+
+def build_agent_executor(
     vectorstore: FAISS,
     api_key: str,
     model: str = "llama-3.1-8b-instant",
-    k_docs: int = 5,
-) -> ConversationalRetrievalChain:
+) -> AgentExecutor:
     """
-    Build the full RAG Q&A chain with:
-    - FAISS retriever (top-k semantic search)
-    - ConversationBufferWindowMemory (last 6 exchanges)
-    - Custom financial analyst system prompt
+    Build the Agent Executor with Tool Calling capabilities.
     """
     llm = build_llm(api_key, model)
 
-    # Memory: keep last 6 Q&A pairs to maintain context without token overflow
+    tools = [
+        get_document_search_tool(vectorstore),
+        live_stock_price,
+        web_search
+    ]
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", AGENT_SYSTEM_PROMPT),
+        ("placeholder", "{chat_history}"),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+
     memory = ConversationBufferWindowMemory(
         memory_key="chat_history",
         return_messages=True,
-        output_key="answer",
+        output_key="output",
         k=6,
     )
 
-    # Retriever: MMR (Max Marginal Relevance) avoids redundant chunks
-    retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": k_docs, "fetch_k": 10, "lambda_mult": 0.7},
+    agent = create_tool_calling_agent(llm, tools, prompt)
+
+    agent_executor = AgentExecutor(
+        agent=agent, 
+        tools=tools, 
+        memory=memory, 
+        verbose=True,
+        max_iterations=7
     )
 
-    # Build system + human prompt
-    system_prompt = SystemMessagePromptTemplate.from_template(FINANCIAL_SYSTEM_PROMPT)
-    human_prompt = HumanMessagePromptTemplate.from_template(
-        """Use the following financial report excerpts to answer the question.
-        
-Relevant Context:
-{context}
-
-Question: {question}
-
-Provide a detailed, data-driven answer. Always reference specific numbers."""
-    )
-
-    qa_prompt = ChatPromptTemplate.from_messages([system_prompt, human_prompt])
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": qa_prompt},
-        verbose=False,
-    )
-
-    return chain
+    return agent_executor
 
 
 def extract_kpis_with_llm(text: str, api_key: str) -> dict:
@@ -114,7 +147,7 @@ def extract_kpis_with_llm(text: str, api_key: str) -> dict:
         return {"error": str(e), "raw": response.content if "response" in dir() else ""}
 
 
-def generate_summary(vectorstore: FAISS, api_key: str) -> str:
+def generate_summary(vectorstore: FAISS, api_key: str, company_name: str = "the company") -> str:
     """Generate a structured executive summary of the entire report."""
     from prompts import SUMMARY_PROMPT
 
@@ -126,13 +159,15 @@ def generate_summary(vectorstore: FAISS, api_key: str) -> str:
         "revenue profit income financial performance highlights risks"
     )
     context = "\n\n".join([d.page_content for d in broad_docs])
+    
+    formatted_prompt = SUMMARY_PROMPT.format(company_name=company_name)
 
     prompt = f"""Based on this financial report content, provide an executive summary.
 
 CONTENT:
 {context[:4000]}
 
-{SUMMARY_PROMPT}"""
+{formatted_prompt}"""
 
     response = llm.invoke(prompt)
     return response.content

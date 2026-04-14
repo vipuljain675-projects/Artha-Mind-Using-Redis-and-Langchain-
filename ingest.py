@@ -65,13 +65,18 @@ def chunk_documents(docs: list, chunk_size: int = 600, chunk_overlap: int = 80) 
 
 def build_vector_store(chunks: list, store_name: str = "financial_index") -> FAISS:
     """
-    Build a FAISS vector store from document chunks.
+    Build or append to a FAISS vector store from document chunks.
     Saves to disk for reuse across sessions.
     """
     VECTOR_STORE_DIR.mkdir(exist_ok=True)
     embeddings = get_embeddings()
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    existing_store = load_vector_store(store_name)
+    if existing_store:
+        existing_store.add_documents(chunks)
+        vectorstore = existing_store
+    else:
+        vectorstore = FAISS.from_documents(chunks, embeddings)
 
     save_path = str(VECTOR_STORE_DIR / store_name)
     vectorstore.save_local(save_path)

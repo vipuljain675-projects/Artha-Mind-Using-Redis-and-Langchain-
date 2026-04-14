@@ -14,7 +14,7 @@ from redis import Redis
 from rq import Queue
 
 from ingest import load_vector_store
-from chain import build_qa_chain, generate_summary
+from chain import build_agent_executor, generate_summary
 from utils import (
     format_kpi_value,
     SAMPLE_QUESTIONS,
@@ -546,7 +546,7 @@ def init_state():
     defaults = {
         "chat_history": [],         # List of {role, content}
         "vectorstore": None,
-        "qa_chain": None,
+        "agent_executor": None,
         "kpis": None,
         "doc_meta": None,
         "summary": None,
@@ -613,10 +613,11 @@ with st.sidebar:
 
     # Upload PDF
     st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Upload Report</div>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader(
+    uploaded_files = st.file_uploader(
         label="",
         type=["pdf"],
         key="pdf_upload",
+        accept_multiple_files=True,
         label_visibility="collapsed",
         help="Upload annual reports, earnings PDFs, 10-K/10-Q filings",
     )
@@ -640,7 +641,7 @@ with st.sidebar:
                 result = job.result
                 if result.get("status") == "success":
                     st.session_state.doc_meta = {
-                        "filename": result["filename"],
+                        "filenames": result["filenames"],
                         "total_pages": result["total_pages"],
                         "total_chunks": result["total_chunks"]
                     }
@@ -648,7 +649,7 @@ with st.sidebar:
                     st.session_state.vectorstore = load_vector_store("financial_index")
                     
                     # Init Chain
-                    st.session_state.qa_chain = build_qa_chain(
+                    st.session_state.agent_executor = build_agent_executor(
                         st.session_state.vectorstore,
                         st.session_state.api_key,
                         model=st.session_state.selected_model,
@@ -667,15 +668,18 @@ with st.sidebar:
              st.session_state.job_id = None
 
     # Process button
-    if uploaded_file and st.session_state.api_key and not st.session_state.job_id:
+    if uploaded_files and len(uploaded_files) > 0 and st.session_state.api_key and not st.session_state.job_id:
         if st.button("🚀 Analyze Async", use_container_width=True):
             with st.spinner("Queueing…"):
-                # Save uploaded file to temp disk
+                # Save uploaded files to temp disk
                 tmp_dir = os.path.join(os.path.dirname(__file__), "reports")
                 os.makedirs(tmp_dir, exist_ok=True)
-                tmp_path = os.path.join(tmp_dir, f"{str(uuid.uuid4())}.pdf")
-                with open(tmp_path, "wb") as f:
-                    f.write(uploaded_file.read())
+                file_payloads = []
+                for f in uploaded_files:
+                    tmp_path = os.path.join(tmp_dir, f"{str(uuid.uuid4())}.pdf")
+                    with open(tmp_path, "wb") as w:
+                        w.write(f.read())
+                    file_payloads.append({"file_path": tmp_path, "filename": f.name})
                     
                 # Enqueue the job
                 r = Redis(host='localhost', port=6379)
@@ -683,8 +687,7 @@ with st.sidebar:
                 from worker import async_ingest_and_extract
                 job = q.enqueue(
                     async_ingest_and_extract,
-                    file_path=tmp_path,
-                    filename=uploaded_file.name,
+                    files=file_payloads,
                     api_key=st.session_state.api_key,
                     job_timeout='10m'
                 )
@@ -692,16 +695,17 @@ with st.sidebar:
                 # Store job ID in session state so UI loop picks it up
                 st.session_state.job_id = job.id
             st.rerun()
-    elif uploaded_file and not st.session_state.api_key:
+    elif uploaded_files and not st.session_state.api_key:
         st.markdown('<div class="status-banner status-warning">⚠️ Add API key first</div>', unsafe_allow_html=True)
 
     # Doc info
     if st.session_state.doc_meta:
         meta = st.session_state.doc_meta
+        filenames_display = "<br>".join(meta['filenames'])
         st.markdown(f"""
         <div style="background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.15);border-radius:12px;padding:14px;margin-top:16px;">
-            <div style="font-size:0.72rem;color:#64748b;font-weight:600;text-transform:uppercase;margin-bottom:8px;">Active Document</div>
-            <div style="font-size:0.82rem;color:#94a3b8;word-break:break-all;">{meta['filename']}</div>
+            <div style="font-size:0.72rem;color:#64748b;font-weight:600;text-transform:uppercase;margin-bottom:8px;">Active Documents</div>
+            <div style="font-size:0.82rem;color:#94a3b8;word-break:break-all;">{filenames_display}</div>
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
                 <span style="background:rgba(16,185,129,0.1);border-radius:6px;padding:2px 8px;font-size:0.72rem;color:#34d399;">
                     📄 {meta['total_pages']} pages
@@ -718,7 +722,7 @@ with st.sidebar:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.chat_history = []
-            st.session_state.qa_chain = build_qa_chain(
+            st.session_state.agent_executor = build_agent_executor(
                 st.session_state.vectorstore,
                 st.session_state.api_key,
                 model=st.session_state.selected_model,
@@ -792,10 +796,9 @@ if not st.session_state.vectorstore:
 
 else:
     # Document loaded — show full UI
-    kpis = st.session_state.kpis or {}
-
+    
     # ── KPI Dashboard ──────────────────────────────────────────────────────
-    if kpis and "error" not in kpis:
+    if st.session_state.kpis:
         st.markdown("""
         <div class="section-header">
             <div class="section-icon icon-green">📈</div>
@@ -803,66 +806,79 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
-        company = kpis.get("company_name", "Company")
-        period = kpis.get("report_period", "")
+        # Multi-document KPI dropdown logic
+        if isinstance(st.session_state.kpis, dict) and not "company_name" in st.session_state.kpis:
+            # It's a dict mapping filenames to KPIs
+            available_files = list(st.session_state.kpis.keys())
+            if available_files:
+                selected_file_for_kpi = st.selectbox("Select document KPIs to view:", available_files, key="kpi_selector")
+                kpis = st.session_state.kpis[selected_file_for_kpi]
+            else:
+                kpis = {}
+        else:
+            kpis = st.session_state.kpis
 
-        if company:
-            st.markdown(f"""
-            <div style="font-size:1.4rem;font-weight:700;color:#f0f9ff;margin-bottom:4px;">{company}</div>
-            <div style="font-size:0.85rem;color:#475569;margin-bottom:20px;">{period}</div>
-            """, unsafe_allow_html=True)
+        if kpis and "error" not in kpis:
+            company = kpis.get("company_name", "Company")
+            period = kpis.get("report_period", "")
 
-        # KPI Cards
-        kpi_items = [
-            ("💰 Gross Revenue", kpis.get("revenue"), kpis.get("revenue_growth")),
-            ("📊 Net Income", kpis.get("net_income"), kpis.get("net_margin")),
-            ("💼 EBITDA", kpis.get("ebitda"), None),
-            ("📈 EPS", kpis.get("eps"), None),
-            ("💧 Cash Flow", kpis.get("operating_cash_flow"), None),
-            ("🏦 Total Assets", kpis.get("total_assets"), None),
-            ("📉 Total Debt", kpis.get("total_debt"), kpis.get("debt_to_equity")),
-            ("💹 ROE", kpis.get("roe"), None),
-        ]
+            if company:
+                st.markdown(f"""
+                <div style="font-size:1.4rem;font-weight:700;color:#f0f9ff;margin-bottom:4px;">{company}</div>
+                <div style="font-size:0.85rem;color:#475569;margin-bottom:20px;">{period}</div>
+                """, unsafe_allow_html=True)
 
-        kpi_html = '<div class="kpi-grid">'
-        for label, value, delta in kpi_items:
-            val_str = format_kpi_value(value)
-            delta_html = ""
-            if delta and delta != "N/A" and delta != "null":
-                is_pos = "+" in str(delta) or (not str(delta).startswith("-"))
-                cls = "positive" if is_pos else "negative"
-                delta_html = f'<div class="kpi-delta {cls}">{delta}</div>'
+            # KPI Cards
+            kpi_items = [
+                ("💰 Gross Revenue", kpis.get("revenue"), kpis.get("revenue_growth")),
+                ("📊 Net Income", kpis.get("net_income"), kpis.get("net_margin")),
+                ("💼 EBITDA", kpis.get("ebitda"), None),
+                ("📈 EPS", kpis.get("eps"), None),
+                ("💧 Cash Flow", kpis.get("operating_cash_flow"), None),
+                ("🏦 Total Assets", kpis.get("total_assets"), None),
+                ("📉 Total Debt", kpis.get("total_debt"), kpis.get("debt_to_equity")),
+                ("💹 ROE", kpis.get("roe"), None),
+            ]
 
-            kpi_html += f"""<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{val_str}</div>{delta_html}</div>"""
+            kpi_html = '<div class="kpi-grid">'
+            for label, value, delta in kpi_items:
+                val_str = format_kpi_value(value)
+                delta_html = ""
+                if delta and delta != "N/A" and delta != "null":
+                    is_pos = "+" in str(delta) or (not str(delta).startswith("-"))
+                    cls = "positive" if is_pos else "negative"
+                    delta_html = f'<div class="kpi-delta {cls}">{delta}</div>'
 
-        kpi_html += "</div>"
-        st.markdown(kpi_html, unsafe_allow_html=True)
+                kpi_html += f"""<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{val_str}</div>{delta_html}</div>"""
 
-        # Highlights & Risks row
-        high = kpis.get("key_highlight")
-        risk = kpis.get("risk_flag")
-        if high or risk:
-            c1, c2 = st.columns(2)
-            if high:
-                with c1:
-                    st.markdown(f"""
-                    <div style="background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.2);
-                                border-radius:14px;padding:18px;height:100%;">
-                        <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;
-                                    letter-spacing:0.1em;color:#10b981;margin-bottom:8px;">✅ KEY HIGHLIGHT</div>
-                        <div style="font-size:0.88rem;color:#94a3b8;line-height:1.6;">{high}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            if risk:
-                with c2:
-                    st.markdown(f"""
-                    <div style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.18);
-                                border-radius:14px;padding:18px;height:100%;">
-                        <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;
-                                    letter-spacing:0.1em;color:#ef4444;margin-bottom:8px;">⚠️ RISK TO WATCH</div>
-                        <div style="font-size:0.88rem;color:#94a3b8;line-height:1.6;">{risk}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+            kpi_html += "</div>"
+            st.markdown(kpi_html, unsafe_allow_html=True)
+
+            # Highlights & Risks row
+            high = kpis.get("key_highlight")
+            risk = kpis.get("risk_flag")
+            if high or risk:
+                c1, c2 = st.columns(2)
+                if high:
+                    with c1:
+                        st.markdown(f"""
+                        <div style="background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.2);
+                                    border-radius:14px;padding:18px;height:100%;">
+                            <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;
+                                        letter-spacing:0.1em;color:#10b981;margin-bottom:8px;">✅ KEY HIGHLIGHT</div>
+                            <div style="font-size:0.88rem;color:#94a3b8;line-height:1.6;">{high}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                if risk:
+                    with c2:
+                        st.markdown(f"""
+                        <div style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.18);
+                                    border-radius:14px;padding:18px;height:100%;">
+                            <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;
+                                        letter-spacing:0.1em;color:#ef4444;margin-bottom:8px;">⚠️ RISK TO WATCH</div>
+                            <div style="font-size:0.88rem;color:#94a3b8;line-height:1.6;">{risk}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -925,37 +941,21 @@ else:
             send_btn = st.button("Send", use_container_width=True)
 
         # Only trigger on explicit button click with non-empty input
-        if send_btn and user_question and user_question.strip() and st.session_state.qa_chain:
+        if send_btn and user_question and user_question.strip() and st.session_state.agent_executor:
             question = user_question.strip()
             # Rotate the key to clear the input box
             st.session_state.input_key += 1
             
             st.session_state.chat_history.append({"role": "user", "content": question})
 
-            with st.spinner("ArthaMind is analyzing..."):
+            with st.spinner("Agent is analyzing and searching..."):
                 try:
-                    result = st.session_state.qa_chain({"question": question})
-                    answer = result.get("answer", "I couldn't find relevant information in the report.")
-                    source_docs = result.get("source_documents", [])
+                    result = st.session_state.agent_executor.invoke({"input": question})
+                    answer = result.get("output", "I couldn't find a response.")
                 except Exception as e:
                     answer = f"Error: {str(e)}"
-                    source_docs = []
 
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-            # Show source pages used
-            if source_docs:
-                pages_used = sorted(set([
-                    d.metadata.get("page", "?") + 1
-                    for d in source_docs
-                    if isinstance(d.metadata.get("page"), int)
-                ]))
-                if pages_used:
-                    chips = "".join([f'<span class="source-chip">pg.{p}</span>' for p in pages_used[:6]])
-                    st.markdown(
-                        f'<div style="margin-top:6px;font-size:0.75rem;color:#334155;">Sources: {chips}</div>',
-                        unsafe_allow_html=True,
-                    )
             st.rerun()
 
         # Sample question buttons
@@ -967,10 +967,10 @@ else:
                 with q_cols[i % 2]:
                     if st.button(q, key=f"sq_{i}", use_container_width=True):
                         st.session_state.chat_history.append({"role": "user", "content": q})
-                        with st.spinner("Analyzing…"):
+                        with st.spinner("Agent is analyzing and searching..."):
                             try:
-                                result = st.session_state.qa_chain({"question": q})
-                                answer = result.get("answer", "No relevant data found.")
+                                result = st.session_state.agent_executor.invoke({"input": q})
+                                answer = result.get("output", "No response.")
                             except Exception as e:
                                 answer = f"Error: {str(e)}"
                         st.session_state.chat_history.append({"role": "assistant", "content": answer})
@@ -994,9 +994,18 @@ else:
             """, unsafe_allow_html=True)
             if st.button("📝 Generate Executive Summary", use_container_width=True):
                 with st.spinner("Drafting executive summary…"):
+                    # Ensure company name is safely fetched from multi-document dict
+                    active_company = "the company"
+                    if isinstance(st.session_state.kpis, dict):
+                        if "company_name" in st.session_state.kpis:
+                            active_company = st.session_state.kpis.get("company_name", "the company")
+                        elif list(st.session_state.kpis.values()):
+                            active_company = list(st.session_state.kpis.values())[0].get("company_name", "the company")
+
                     summary = generate_summary(
                         st.session_state.vectorstore,
                         st.session_state.api_key,
+                        company_name=active_company
                     )
                     st.session_state.summary = summary
                 st.rerun()
@@ -1015,7 +1024,7 @@ else:
                 st.download_button(
                     label="⬇️ Download Summary",
                     data=st.session_state.summary,
-                    file_name=f"summary_{st.session_state.doc_meta['filename'].replace('.pdf','')}.md",
+                    file_name=f"summary_{st.session_state.doc_meta['filenames'][0].replace('.pdf','')}.md",
                     mime="text/markdown",
                     use_container_width=True,
                 )
