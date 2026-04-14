@@ -1,0 +1,43 @@
+# ── Environment & Secrets ─────────────────────────────────────────
+.env
+.env.local
+.env.production
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── Vector Store (auto-generated, can be large) ───────────────────
+vector_store/
+
+# ── Reports folder (uploaded PDFs, keep sample only) ─────────────
+reports/*.pdf
+
+# ── macOS ─────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── VS Code ───────────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs ──────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Docker volumes (managed by Docker, not git) ───────────────────
+redis_data/
