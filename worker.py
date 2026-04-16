@@ -15,6 +15,15 @@ from langchain_community.document_loaders import PyPDFLoader
 from chain import extract_kpis_with_llm
 
 
+def should_delete_temp_file(file_path: str, filename: str) -> bool:
+    """
+    Only delete transient worker copies.
+    If the path basename matches the user-facing filename, treat it as the
+    persistent report copy and keep it on disk.
+    """
+    return os.path.basename(file_path) != filename
+
+
 def async_ingest_and_extract(files: list, api_key: str) -> dict:
     """
     Background job to process massive PDFs without blocking the UI.
@@ -47,7 +56,7 @@ def async_ingest_and_extract(files: list, api_key: str) -> dict:
             multi_kpis[filename] = kpis
 
             # 4. Clean up temp file
-            if os.path.exists(file_path):
+            if os.path.exists(file_path) and should_delete_temp_file(file_path, filename):
                 os.remove(file_path)
 
         # 5. Build/Append to vector DB using all chunks combined
@@ -65,7 +74,10 @@ def async_ingest_and_extract(files: list, api_key: str) -> dict:
     except Exception as e:
         # Cleanup on failure
         for file_info in files:
-            if os.path.exists(file_info["file_path"]):
+            if (
+                os.path.exists(file_info["file_path"])
+                and should_delete_temp_file(file_info["file_path"], file_info["filename"])
+            ):
                 os.remove(file_info["file_path"])
         return {"status": "error", "error": str(e)}
 
@@ -82,4 +94,3 @@ if __name__ == "__main__":
     q = Queue(connection=redis_conn)
     w = SimpleWorker([q], connection=redis_conn)
     w.work()
-

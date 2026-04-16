@@ -7,6 +7,10 @@ import json
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
+import time
+import random
+import functools
+
 
 
 # ── KPI Formatting ──────────────────────────────────────────────────────────────
@@ -16,6 +20,39 @@ def format_kpi_value(value) -> str:
     if value is None or value == "null":
         return "N/A"
     return str(value)
+
+
+def retry_with_backoff(max_retries=3, initial_delay=1, backoff_factor=2, jitter=True):
+    """
+    Retry decorator with exponential backoff.
+    Immediately raises without retrying on HTTP 429 (quota exhausted).
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            delay = initial_delay
+            while retries <= max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    # 429 = quota exhausted — retrying won't help, raise immediately
+                    error_str = str(e)
+                    if "429" in error_str or "quota" in error_str.lower() or "RESOURCE_EXHAUSTED" in error_str:
+                        raise e
+
+                    if retries == max_retries:
+                        raise e
+
+                    wait_time = delay
+                    if jitter:
+                        wait_time += random.uniform(0, 1)
+
+                    time.sleep(wait_time)
+                    retries += 1
+                    delay *= backoff_factor
+        return wrapper
+    return decorator
 
 
 def kpi_delta_color(value: str) -> str:
@@ -162,17 +199,42 @@ SAMPLE_QUESTIONS = [
     "⚠️ What are the main risk factors mentioned in the report?",
     "📈 Summarize the company's growth strategy going forward.",
     "🏦 What is the company's debt situation and liquidity position?",
+    "🌍 If crude prices rise or the rupee weakens, what happens to the business?",
     "🎯 What were the biggest achievements this financial year?",
     "📉 Are there any warning signs or areas of concern for investors?",
     "💼 What does management say about the outlook for next year?",
+    "🗞️ What current world developments could matter most for this business?",
 ]
 
 
-def get_model_options() -> dict:
-    """Available Groq models with descriptions."""
+def get_answer_provider_options() -> dict:
+    """Available answer engines for analyst chat and executive summary."""
+    return {
+        "🔎 Gemini": "gemini",
+        "🌐 OpenAI": "openai",
+        "⚡ Groq": "groq",
+    }
+
+
+def get_model_options(provider: str = "groq") -> dict:
+    """Available models grouped by answer provider."""
+    normalized = (provider or "groq").lower()
+    if normalized == "gemini":
+        return {
+            "🔎 Gemini 2.5 Flash (Fast)": "gemini-2.5-flash",
+            "🧠 Gemini 2.5 Pro (Deep Analysis)": "gemini-2.5-pro",
+        }
+    if normalized == "openai":
+        return {
+            "🌐 GPT-4.1 Mini (Balanced)": "gpt-4.1-mini",
+            "🧠 GPT-4.1 (Higher Quality)": "gpt-4.1",
+        }
     return {
         "⚡ Llama 3.1 8B (Fast)": "llama-3.1-8b-instant",
-        "🧠 Llama 3.3 70B (Deep Analysis)": "llama-3.3-70b-versatile",
-        "🔥 Mixtral 8x7B (Balanced)": "mixtral-8x7b-32768",
-        "💎 Gemma 7B (Efficient)": "gemma-7b-it",
+        "🧠 Llama 3.3 70B (Premium Summary)": "llama-3.3-70b-versatile",
     }
+
+
+def get_default_model(provider: str = "groq") -> str:
+    """Return the default model for a provider."""
+    return next(iter(get_model_options(provider).values()))

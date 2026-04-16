@@ -3,9 +3,11 @@ app.py — ArthaMind: AI Financial Report Analyst
 Main Streamlit application with premium dark UI
 """
 
+import html
 import os
 import time
 import json
+import traceback
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -13,11 +15,20 @@ import uuid
 from redis import Redis
 from rq import Queue
 
-from ingest import load_vector_store
-from chain import build_agent_executor, generate_summary
+from ingest import extract_raw_text, load_vector_store
+from chain import (
+    build_agent_executor,
+    extract_kpis_with_llm,
+    generate_summary,
+    normalize_answer_provider,
+    resolve_agent_model,
+    run_agent_turn,
+)
 from utils import (
     format_kpi_value,
     SAMPLE_QUESTIONS,
+    get_answer_provider_options,
+    get_default_model,
     get_model_options,
     make_kpi_gauge,
     make_bar_chart,
@@ -25,6 +36,12 @@ from utils import (
 )
 
 load_dotenv()
+
+LIVE_SEARCH_OPTIONS = {
+    "🌐 OpenAI Web Search": "openai",
+    "🔎 Gemini Google Search": "gemini",
+    "🪶 DuckDuckGo Fallback": "duckduckgo",
+}
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -543,6 +560,25 @@ hr { border-color: var(--border) !important; margin: 24px 0 !important; }
 
 # ── Session State Init ──────────────────────────────────────────────────────
 def init_state():
+    default_answer_provider = os.getenv("ANSWER_PROVIDER")
+    if not default_answer_provider:
+        if os.getenv("GEMINI_API_KEY"):
+            default_answer_provider = "gemini"
+        elif os.getenv("OPENAI_API_KEY"):
+            default_answer_provider = "openai"
+        else:
+            default_answer_provider = "groq"
+    default_answer_provider = normalize_answer_provider(default_answer_provider)
+
+    default_live_provider = os.getenv("LIVE_SEARCH_PROVIDER")
+    if not default_live_provider:
+        if os.getenv("OPENAI_API_KEY"):
+            default_live_provider = "openai"
+        elif os.getenv("GEMINI_API_KEY"):
+            default_live_provider = "gemini"
+        else:
+            default_live_provider = "duckduckgo"
+
     defaults = {
         "chat_history": [],         # List of {role, content}
         "vectorstore": None,
@@ -553,14 +589,203 @@ def init_state():
         "processing": False,
         "job_id": None,
         "api_key": os.getenv("GROQ_API_KEY", ""),
-        "selected_model": "llama-3.1-8b-instant",
+        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+        "answer_provider": default_answer_provider,
+        "selected_model": get_default_model(default_answer_provider),
+        "live_search_provider": default_live_provider,
+        "openai_web_model": os.getenv("OPENAI_WEB_SEARCH_MODEL", "gpt-4.1-mini"),
+        "gemini_web_model": os.getenv("GEMINI_WEB_SEARCH_MODEL", "gemini-2.5-flash"),
         "active_tab": "chat",
+        "active_file": None,
+        "input_key": 0,
+        "agent_requested_model": None,
+        "agent_active_file": None,
+        "agent_effective_model": None,
+        "agent_notice": None,
+        "agent_answer_provider": None,
+        "agent_live_search_provider": None,
+        "agent_openai_api_key": None,
+        "agent_gemini_api_key": None,
+        "kpi_notice": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 init_state()
+
+
+def is_valid_kpi_payload(payload) -> bool:
+    return isinstance(payload, dict) and bool(payload) and "error" not in payload
+
+
+def merge_kpi_results(previous_kpis, new_kpis):
+    """Preserve the last good KPI snapshot if a re-run extraction fails."""
+    if not isinstance(new_kpis, dict):
+        return new_kpis, None
+
+    previous_map = previous_kpis if isinstance(previous_kpis, dict) else {}
+    merged = {}
+    notices = []
+
+    for filename, payload in new_kpis.items():
+        previous_payload = previous_map.get(filename)
+        if is_valid_kpi_payload(payload):
+            merged[filename] = payload
+        elif is_valid_kpi_payload(previous_payload):
+            merged[filename] = previous_payload
+            notices.append(
+                f"KPI extraction failed for {filename}, so ArthaMind kept the previous successful KPI snapshot."
+            )
+        else:
+            merged[filename] = payload
+            notices.append(
+                f"KPI extraction failed for {filename}. Chat and summary can still use the report, but KPI cards may be unavailable."
+            )
+
+    return merged, " ".join(notices) if notices else None
+
+
+def recover_missing_kpis(kpi_map):
+    """Try a local KPI recovery pass when the worker returns an error payload."""
+    if not isinstance(kpi_map, dict):
+        return kpi_map, None
+
+    recovered = dict(kpi_map)
+    notices = []
+
+    for filename, payload in kpi_map.items():
+        if is_valid_kpi_payload(payload):
+            continue
+
+        local_path = os.path.join(os.path.dirname(__file__), "reports", filename)
+        if not os.path.exists(local_path) or not st.session_state.api_key:
+            continue
+
+        try:
+            with open(local_path, "rb") as report_file:
+                raw_text = extract_raw_text(report_file.read(), filename, max_pages=10)
+            recovered_payload = extract_kpis_with_llm(raw_text, st.session_state.api_key)
+            if is_valid_kpi_payload(recovered_payload):
+                recovered[filename] = recovered_payload
+                notices.append(f"Recovered KPI cards locally for {filename}.")
+        except Exception as exc:
+            notices.append(f"Local KPI recovery failed for {filename}: {exc}")
+
+    return recovered, " ".join(notices) if notices else None
+
+
+def sync_agent_executor(force: bool = False) -> None:
+    """Keep the tool-calling chat agent aligned with the selected model and document."""
+    if not st.session_state.vectorstore:
+        return
+
+    if st.session_state.answer_provider != "groq":
+        st.session_state.agent_executor = None
+        st.session_state.agent_requested_model = st.session_state.selected_model
+        st.session_state.agent_active_file = st.session_state.get("active_file")
+        st.session_state.agent_effective_model = st.session_state.selected_model
+        st.session_state.agent_answer_provider = st.session_state.answer_provider
+        st.session_state.agent_notice = (
+            f"Analyst Chat is powered by `{st.session_state.selected_model}` via "
+            f"{st.session_state.answer_provider.capitalize()}."
+        )
+        return
+
+    if not st.session_state.api_key:
+        return
+
+    active_filename = st.session_state.get("active_file")
+    current_agent = st.session_state.get("agent_executor")
+    needs_rebuild = force or current_agent is None
+
+    if current_agent is not None and not needs_rebuild:
+        needs_rebuild = any((
+            st.session_state.get("agent_answer_provider") != st.session_state.answer_provider,
+            st.session_state.get("agent_requested_model") != st.session_state.selected_model,
+            st.session_state.get("agent_active_file") != active_filename,
+            st.session_state.get("agent_live_search_provider") != st.session_state.live_search_provider,
+            st.session_state.get("agent_openai_api_key") != st.session_state.openai_api_key,
+            st.session_state.get("agent_gemini_api_key") != st.session_state.gemini_api_key,
+        ))
+
+    if needs_rebuild:
+        effective_model, notice = resolve_agent_model(st.session_state.selected_model)
+        st.session_state.agent_executor = build_agent_executor(
+            st.session_state.vectorstore,
+            st.session_state.api_key,
+            model=st.session_state.selected_model,
+            active_filename=active_filename,
+            live_search_provider=st.session_state.live_search_provider,
+            openai_api_key=st.session_state.openai_api_key,
+            gemini_api_key=st.session_state.gemini_api_key,
+            openai_web_model=st.session_state.openai_web_model,
+            gemini_web_model=st.session_state.gemini_web_model,
+        )
+        st.session_state.agent_answer_provider = st.session_state.answer_provider
+        st.session_state.agent_requested_model = st.session_state.selected_model
+        st.session_state.agent_active_file = active_filename
+        st.session_state.agent_effective_model = effective_model
+        st.session_state.agent_notice = notice
+        st.session_state.agent_live_search_provider = st.session_state.live_search_provider
+        st.session_state.agent_openai_api_key = st.session_state.openai_api_key
+        st.session_state.agent_gemini_api_key = st.session_state.gemini_api_key
+
+
+def submit_chat_question(question: str) -> None:
+    """Run one chat turn with graceful model fallback handling."""
+    st.session_state.chat_history.append({"role": "user", "content": question})
+
+    with st.spinner("Agent is analyzing and searching..."):
+        try:
+            sync_agent_executor()
+            result = run_agent_turn(
+                agent_executor=st.session_state.agent_executor,
+                question=question,
+                vectorstore=st.session_state.vectorstore,
+                api_key=st.session_state.api_key,
+                requested_model=st.session_state.selected_model,
+                answer_provider=st.session_state.answer_provider,
+                active_filename=st.session_state.get("active_file"),
+                live_search_provider=st.session_state.live_search_provider,
+                openai_api_key=st.session_state.openai_api_key,
+                gemini_api_key=st.session_state.gemini_api_key,
+                openai_web_model=st.session_state.openai_web_model,
+                gemini_web_model=st.session_state.gemini_web_model,
+                chat_history=st.session_state.chat_history[:-1],
+            )
+            st.session_state.agent_executor = result["agent_executor"]
+            st.session_state.agent_answer_provider = st.session_state.answer_provider
+            st.session_state.agent_requested_model = st.session_state.selected_model
+            st.session_state.agent_active_file = st.session_state.get("active_file")
+            st.session_state.agent_effective_model = result.get("effective_model")
+            st.session_state.agent_notice = result.get("notice")
+            st.session_state.agent_live_search_provider = st.session_state.live_search_provider
+            st.session_state.agent_openai_api_key = st.session_state.openai_api_key
+            st.session_state.agent_gemini_api_key = st.session_state.gemini_api_key
+            answer = result["answer"]
+        except Exception as exc:
+            traceback.print_exc()
+            error_str = str(exc)
+            if "503" in error_str or "high demand" in error_str.lower():
+                answer = (
+                    "**Gemini is currently experiencing high demand (503).**\n\n"
+                    "I've attempted several retries, but the service is still unavailable. "
+                    "I've switched ArthaMind to use our fallback logic, but for the most stable experience right now, "
+                    "please consider switching the **Answer Engine** to **Groq** or **OpenAI** in the sidebar."
+                )
+            elif "401" in error_str or "invalid_api_key" in error_str.lower():
+                answer = "It looks like the API key provided is invalid or expired. Please check your settings in the sidebar."
+            else:
+                answer = (
+                    "I hit an unexpected issue while analyzing the report. "
+                    "This can sometimes happen during high traffic or if the document structure is highly atypical. "
+                    "Please try your question again, or switch the **Answer Engine/Model** in the sidebar."
+                )
+
+
+    st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
@@ -574,23 +799,22 @@ with st.sidebar:
     <hr style="border-color:#1e3a5f;margin:0 0 20px 0;">
     """, unsafe_allow_html=True)
 
-    # API Key
-    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Groq API Key</div>', unsafe_allow_html=True)
+    # KPI / Ingestion Key
+    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Groq API Key (KPI Cards)</div>', unsafe_allow_html=True)
     api_key_input = st.text_input(
-        label="",
+        label="Groq API Key (KPI Cards)",
         value=st.session_state.api_key,
         type="password",
         placeholder="gsk_...",
         key="api_input",
         label_visibility="collapsed",
     )
-    if api_key_input:
-        st.session_state.api_key = api_key_input
+    st.session_state.api_key = api_key_input
 
     if st.session_state.api_key:
-        st.markdown('<div class="status-banner status-success">✅ API key connected</div>', unsafe_allow_html=True)
+        st.markdown('<div class="status-banner status-success">✅ Groq KPI key connected</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="status-banner status-warning">⚠️ Enter your Groq API key</div>', unsafe_allow_html=True)
+        st.markdown('<div class="status-banner status-warning">⚠️ Add Groq key for KPI extraction and Analyze Async</div>', unsafe_allow_html=True)
         st.markdown(
             '<a href="https://console.groq.com" target="_blank" style="color:#10b981;font-size:0.8rem;">→ Get free key at console.groq.com</a>',
             unsafe_allow_html=True,
@@ -598,23 +822,108 @@ with st.sidebar:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Answer Engine</div>', unsafe_allow_html=True)
+    provider_opts = get_answer_provider_options()
+    provider_labels = list(provider_opts.keys())
+    if st.session_state.answer_provider not in provider_opts.values():
+        st.session_state.answer_provider = "gemini"
+    current_provider_label = next(
+        label for label, provider_name in provider_opts.items()
+        if provider_name == st.session_state.answer_provider
+    )
+    chosen_provider_label = st.selectbox(
+        label="Answer Engine",
+        options=provider_labels,
+        index=provider_labels.index(current_provider_label),
+        label_visibility="collapsed",
+    )
+    st.session_state.answer_provider = provider_opts[chosen_provider_label]
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Live Web Search</div>', unsafe_allow_html=True)
+    live_search_labels = list(LIVE_SEARCH_OPTIONS.keys())
+    if st.session_state.live_search_provider not in LIVE_SEARCH_OPTIONS.values():
+        st.session_state.live_search_provider = "duckduckgo"
+    current_live_label = next(
+        label for label, provider in LIVE_SEARCH_OPTIONS.items()
+        if provider == st.session_state.live_search_provider
+    )
+    chosen_live_label = st.selectbox(
+        label="Live Web Search Provider",
+        options=live_search_labels,
+        index=live_search_labels.index(current_live_label),
+        label_visibility="collapsed",
+    )
+    st.session_state.live_search_provider = LIVE_SEARCH_OPTIONS[chosen_live_label]
+
+    openai_key_input = st.text_input(
+        label="OpenAI API Key",
+        value=st.session_state.openai_api_key,
+        type="password",
+        placeholder="OpenAI API key (optional)",
+        key="openai_api_input",
+        label_visibility="collapsed",
+    )
+    st.session_state.openai_api_key = openai_key_input
+
+    gemini_key_input = st.text_input(
+        label="Gemini API Key",
+        value=st.session_state.gemini_api_key,
+        type="password",
+        placeholder="Gemini API key (optional)",
+        key="gemini_api_input",
+        label_visibility="collapsed",
+    )
+    st.session_state.gemini_api_key = gemini_key_input
+
+    if st.session_state.live_search_provider == "openai":
+        if st.session_state.openai_api_key:
+            st.markdown('<div class="status-banner status-success">✅ OpenAI live search ready</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-banner status-warning">⚠️ OpenAI selected, but API key is missing. Search will fall back to DuckDuckGo.</div>', unsafe_allow_html=True)
+    elif st.session_state.live_search_provider == "gemini":
+        if st.session_state.gemini_api_key:
+            st.markdown('<div class="status-banner status-success">✅ Gemini live search ready</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-banner status-warning">⚠️ Gemini selected, but API key is missing. Search will fall back to DuckDuckGo.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="status-banner status-warning">🌐 Using DuckDuckGo fallback for best-effort live search</div>', unsafe_allow_html=True)
+
+    st.caption("Answer Engine powers Analyst Chat and Executive Summary. Live Web Search powers the current-world context layer.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # Model Selection
-    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">AI Model</div>', unsafe_allow_html=True)
-    model_opts = get_model_options()
+    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Answer Model</div>', unsafe_allow_html=True)
+    model_opts = get_model_options(st.session_state.answer_provider)
+    model_labels = list(model_opts.keys())
+    if st.session_state.selected_model not in model_opts.values():
+        st.session_state.selected_model = get_default_model(st.session_state.answer_provider)
+    current_model_label = next(
+        label for label, model_name in model_opts.items()
+        if model_name == st.session_state.selected_model
+    )
     chosen_model_label = st.selectbox(
-        label="",
-        options=list(model_opts.keys()),
-        key="model_select",
+        label="AI Model",
+        options=model_labels,
+        index=model_labels.index(current_model_label),
         label_visibility="collapsed",
     )
     st.session_state.selected_model = model_opts[chosen_model_label]
+    if st.session_state.answer_provider == "groq" and st.session_state.selected_model == "llama-3.3-70b-versatile":
+        st.caption("Analyst Chat auto-uses Llama 3.1 8B for stable tool calls. Executive Summary still uses 70B.")
+    elif st.session_state.answer_provider == "gemini":
+        st.caption("Analyst Chat and Executive Summary are answered by Gemini. Groq is only used for KPI extraction.")
+    elif st.session_state.answer_provider == "openai":
+        st.caption("Analyst Chat and Executive Summary are answered by OpenAI. Groq is only used for KPI extraction.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # Upload PDF
     st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Upload Report</div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
-        label="",
+        label="Upload Financial Report",
         type=["pdf"],
         key="pdf_upload",
         accept_multiple_files=True,
@@ -645,15 +954,21 @@ with st.sidebar:
                         "total_pages": result["total_pages"],
                         "total_chunks": result["total_chunks"]
                     }
-                    st.session_state.kpis = result["kpis"]
+                    merged_kpis, kpi_notice = merge_kpi_results(
+                        st.session_state.get("kpis"),
+                        result["kpis"],
+                    )
+                    merged_kpis, recovery_notice = recover_missing_kpis(merged_kpis)
+                    st.session_state.kpis = merged_kpis
+                    st.session_state.kpi_notice = " ".join(
+                        [msg for msg in (kpi_notice, recovery_notice) if msg]
+                    ) or None
                     st.session_state.vectorstore = load_vector_store("financial_index")
                     
-                    # Init Chain
-                    st.session_state.agent_executor = build_agent_executor(
-                        st.session_state.vectorstore,
-                        st.session_state.api_key,
-                        model=st.session_state.selected_model,
-                    )
+                    # Init Agent with active_filename filter so FAISS only searches this document
+                    first_file = result["filenames"][0] if result["filenames"] else None
+                    st.session_state.active_file = first_file
+                    sync_agent_executor(force=True)
                     st.session_state.chat_history = []
                     st.session_state.summary = None
                     st.session_state.job_id = None
@@ -676,9 +991,12 @@ with st.sidebar:
                 os.makedirs(tmp_dir, exist_ok=True)
                 file_payloads = []
                 for f in uploaded_files:
+                    persistent_path = os.path.join(tmp_dir, f.name)
+                    with open(persistent_path, "wb") as persistent_file:
+                        persistent_file.write(f.getbuffer())
                     tmp_path = os.path.join(tmp_dir, f"{str(uuid.uuid4())}.pdf")
                     with open(tmp_path, "wb") as w:
-                        w.write(f.read())
+                        w.write(f.getbuffer())
                     file_payloads.append({"file_path": tmp_path, "filename": f.name})
                     
                 # Enqueue the job
@@ -696,7 +1014,7 @@ with st.sidebar:
                 st.session_state.job_id = job.id
             st.rerun()
     elif uploaded_files and not st.session_state.api_key:
-        st.markdown('<div class="status-banner status-warning">⚠️ Add API key first</div>', unsafe_allow_html=True)
+        st.markdown('<div class="status-banner status-warning">⚠️ Add the Groq KPI key first to build KPI cards and analyze the report.</div>', unsafe_allow_html=True)
 
     # Doc info
     if st.session_state.doc_meta:
@@ -722,17 +1040,13 @@ with st.sidebar:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.chat_history = []
-            st.session_state.agent_executor = build_agent_executor(
-                st.session_state.vectorstore,
-                st.session_state.api_key,
-                model=st.session_state.selected_model,
-            )
+            sync_agent_executor(force=True)
             st.rerun()
 
     # Footer
     st.markdown("""
     <div style="margin-top:40px;text-align:center;padding:10px 0;">
-        <div style="font-size:0.72rem;color:#334155;">Powered by LangChain + Groq + Llama 3.1</div>
+        <div style="font-size:0.72rem;color:#334155;">Powered by LangChain + Gemini/OpenAI answer engines + Groq KPI extraction</div>
         <div style="font-size:0.68rem;color:#1e3a5f;margin-top:2px;">Built with ❤️ for financial intelligence</div>
     </div>
     """, unsafe_allow_html=True)
@@ -745,7 +1059,7 @@ st.markdown("""
 <div class="arthamind-hero">
     <div class="hero-title">📊 ArthaMind</div>
     <div class="hero-subtitle">AI-Powered Financial Report Analyst — Instant insights from any financial document</div>
-    <span class="hero-badge"><span class="badge-dot"></span>Llama 3 Powered</span>
+    <span class="hero-badge"><span class="badge-dot"></span>Multi-LLM Powered</span>
     <span class="hero-badge" style="color:#93c5fd;background:rgba(59,130,246,0.1);border-color:rgba(59,130,246,0.25);">
         <span class="badge-dot" style="background:#3b82f6;"></span>RAG Architecture
     </span>
@@ -771,7 +1085,7 @@ if not st.session_state.vectorstore:
         <div class="kpi-card" style="animation-delay:0.2s;">
             <div style="font-size:2rem;margin-bottom:12px;">🔑</div>
             <div style="font-size:1rem;font-weight:700;color:#f0f9ff;margin-bottom:8px;">Step 2 — Add API Key</div>
-            <div style="font-size:0.85rem;color:#64748b;line-height:1.5;">Get your free Groq API key at console.groq.com — runs Llama 3 at 500+ tokens/sec</div>
+            <div style="font-size:0.85rem;color:#64748b;line-height:1.5;">Choose Gemini, OpenAI, or Groq for answers. Groq is still used for KPI extraction from uploaded reports.</div>
         </div>
         """, unsafe_allow_html=True)
     with cols[2]:
@@ -796,6 +1110,7 @@ if not st.session_state.vectorstore:
 
 else:
     # Document loaded — show full UI
+    sync_agent_executor()
     
     # ── KPI Dashboard ──────────────────────────────────────────────────────
     if st.session_state.kpis:
@@ -806,17 +1121,27 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
+        if st.session_state.get("kpi_notice"):
+            st.markdown(
+                f'<div class="status-banner status-warning">⚠️ {html.escape(st.session_state.kpi_notice)}</div>',
+                unsafe_allow_html=True,
+            )
+
         # Multi-document KPI dropdown logic
         if isinstance(st.session_state.kpis, dict) and not "company_name" in st.session_state.kpis:
             # It's a dict mapping filenames to KPIs
             available_files = list(st.session_state.kpis.keys())
             if available_files:
                 selected_file_for_kpi = st.selectbox("Select document KPIs to view:", available_files, key="kpi_selector")
+                st.session_state.active_file = selected_file_for_kpi
+                sync_agent_executor()
                 kpis = st.session_state.kpis[selected_file_for_kpi]
             else:
                 kpis = {}
         else:
             kpis = st.session_state.kpis
+            if st.session_state.agent_executor is None and st.session_state.vectorstore:
+                sync_agent_executor()
 
         if kpis and "error" not in kpis:
             company = kpis.get("company_name", "Company")
@@ -879,6 +1204,11 @@ else:
                             <div style="font-size:0.88rem;color:#94a3b8;line-height:1.6;">{risk}</div>
                         </div>
                         """, unsafe_allow_html=True)
+        elif isinstance(kpis, dict) and "error" in kpis:
+            st.markdown(
+                '<div class="status-banner status-warning">⚠️ KPI extraction failed for this document. The report is still loaded, so chat and executive summary should continue to work.</div>',
+                unsafe_allow_html=True,
+            )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -893,6 +1223,13 @@ else:
             <h2>Chat with the Report</h2>
         </div>
         """, unsafe_allow_html=True)
+
+        agent_notice = st.session_state.get("agent_notice")
+        if agent_notice:
+            st.markdown(
+                f'<div class="status-banner status-warning">💡 {agent_notice}</div>',
+                unsafe_allow_html=True,
+            )
 
         # Quick question pills
         if not st.session_state.chat_history:
@@ -925,15 +1262,11 @@ else:
 
         # Input row
         col_input, col_btn = st.columns([5, 1])
-        
-        # Use a key stored in session state to clear input after send
-        if "input_key" not in st.session_state:
-            st.session_state.input_key = 0
-            
+
         with col_input:
             user_question = st.text_input(
-                label="",
-                placeholder="Ask about revenue, profit margins, risks, strategy",
+                label="Ask a Question About the Report",
+                placeholder="Ask about revenue, risks, outlook, or what-if scenarios",
                 key=f"user_question_{st.session_state.input_key}",
                 label_visibility="collapsed",
             )
@@ -941,21 +1274,11 @@ else:
             send_btn = st.button("Send", use_container_width=True)
 
         # Only trigger on explicit button click with non-empty input
-        if send_btn and user_question and user_question.strip() and st.session_state.agent_executor:
+        if send_btn and user_question and user_question.strip() and st.session_state.vectorstore:
             question = user_question.strip()
             # Rotate the key to clear the input box
             st.session_state.input_key += 1
-            
-            st.session_state.chat_history.append({"role": "user", "content": question})
-
-            with st.spinner("Agent is analyzing and searching..."):
-                try:
-                    result = st.session_state.agent_executor.invoke({"input": question})
-                    answer = result.get("output", "I couldn't find a response.")
-                except Exception as e:
-                    answer = f"Error: {str(e)}"
-
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            submit_chat_question(question)
             st.rerun()
 
         # Sample question buttons
@@ -966,14 +1289,7 @@ else:
             for i, q in enumerate(SAMPLE_QUESTIONS[:4]):
                 with q_cols[i % 2]:
                     if st.button(q, key=f"sq_{i}", use_container_width=True):
-                        st.session_state.chat_history.append({"role": "user", "content": q})
-                        with st.spinner("Agent is analyzing and searching..."):
-                            try:
-                                result = st.session_state.agent_executor.invoke({"input": q})
-                                answer = result.get("output", "No response.")
-                            except Exception as e:
-                                answer = f"Error: {str(e)}"
-                        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                        submit_chat_question(q)
                         st.rerun()
 
     # ── SUMMARY TAB ───────────────────────────────────────────────────────
@@ -1002,13 +1318,36 @@ else:
                         elif list(st.session_state.kpis.values()):
                             active_company = list(st.session_state.kpis.values())[0].get("company_name", "the company")
 
-                    summary = generate_summary(
-                        st.session_state.vectorstore,
-                        st.session_state.api_key,
-                        company_name=active_company
-                    )
-                    st.session_state.summary = summary
+                    try:
+                        summary = generate_summary(
+                            st.session_state.vectorstore,
+                            st.session_state.api_key,
+                            company_name=active_company,
+                            answer_provider=st.session_state.answer_provider,
+                            model=st.session_state.selected_model,
+                            openai_api_key=st.session_state.openai_api_key,
+                            gemini_api_key=st.session_state.gemini_api_key,
+                        )
+                        st.session_state.summary = summary
+                    except Exception as exc:
+                        error_str = str(exc)
+                        if "429" in error_str or "quota" in error_str.lower() or "RESOURCE_EXHAUSTED" in error_str:
+                            st.error(
+                                "**Gemini quota exceeded (HTTP 429).**\n\n"
+                                "Your free-tier Gemini API key has hit its daily limit. "
+                                "Please switch the **Answer Engine** in the sidebar to **Groq** "
+                                "and try generating the summary again."
+                            )
+                        elif "503" in error_str or "unavailable" in error_str.lower():
+                            st.error(
+                                "**Answer Engine temporarily unavailable (503).**\n\n"
+                                "Please switch to **Groq** in the sidebar or try again in a moment."
+                            )
+                        else:
+                            st.error(f"Summary generation failed: {error_str[:300]}")
+                        st.stop()
                 st.rerun()
+
         else:
             with st.container():
                 st.markdown('<div class="summary-container">', unsafe_allow_html=True)

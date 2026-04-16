@@ -89,15 +89,21 @@ def load_vector_store(store_name: str = "financial_index") -> "FAISS":
     Returns None if not found.
     """
     store_path = VECTOR_STORE_DIR / store_name
-    if not store_path.exists():
+    index_path = store_path / "index.faiss"
+    metadata_path = store_path / "index.pkl"
+
+    if not store_path.exists() or not index_path.exists() or not metadata_path.exists():
         return None
 
     embeddings = get_embeddings()
-    return FAISS.load_local(
-        str(store_path),
-        embeddings,
-        allow_dangerous_deserialization=True,
-    )
+    try:
+        return FAISS.load_local(
+            str(store_path),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+    except Exception:
+        return None
 
 
 def process_pdf(file_bytes: bytes, filename: str, store_name: str = "financial_index") -> dict:
