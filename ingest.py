@@ -131,3 +131,15 @@ def extract_raw_text(file_bytes: bytes, filename: str, max_pages: int = 10) -> s
     """Extract the first N pages of text for quick KPI extraction."""
     docs = load_pdf(file_bytes, filename)
     return "\n\n".join([d.page_content for d in docs[:max_pages]])
+
+
+def build_peer_vectorstore(file_bytes: bytes, filename: str) -> FAISS:
+    """
+    Build an in-memory FAISS vectorstore for a competitor report.
+    Does NOT save to disk — lives only in session state.
+    """
+    docs = load_pdf(file_bytes, filename)
+    chunks = chunk_documents(docs)
+    embeddings = get_embeddings()
+    return FAISS.from_documents(chunks, embeddings)
+

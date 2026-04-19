@@ -15,7 +15,7 @@ import uuid
 from redis import Redis
 from rq import Queue
 
-from ingest import extract_raw_text, load_vector_store
+from ingest import extract_raw_text, load_vector_store, build_peer_vectorstore
 from chain import (
     build_agent_executor,
     extract_kpis_with_llm,
@@ -23,6 +23,9 @@ from chain import (
     normalize_answer_provider,
     resolve_agent_model,
     run_agent_turn,
+    run_peer_comparison,
+    fetch_commodity_live_price,
+    COMMODITY_SEARCH_QUERIES,
 )
 from utils import (
     format_kpi_value,
@@ -591,6 +594,7 @@ def init_state():
         "api_key": os.getenv("GROQ_API_KEY", ""),
         "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
         "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+        "gemini_web_api_key": os.getenv("GEMINI_WEB_API_KEY", ""),  # separate key for live search
         "answer_provider": default_answer_provider,
         "selected_model": get_default_model(default_answer_provider),
         "live_search_provider": default_live_provider,
@@ -608,6 +612,15 @@ def init_state():
         "agent_openai_api_key": None,
         "agent_gemini_api_key": None,
         "kpi_notice": None,
+        # Peer Compare
+        "peer_vectorstores": {},        # {filename: FAISS}
+        "peer_kpis": {},                # {filename: kpi_dict}
+        "peer_chat_history": [],
+        "peer_chat_mode": "primary",    # "primary" | "all"
+        # Commodity Radar
+        "commodity_alerts": [],         # list of alert dicts
+        "commodity_prices": {},         # {commodity: {price, raw_text, error}}
+        "commodity_last_checked": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -618,6 +631,12 @@ init_state()
 
 def is_valid_kpi_payload(payload) -> bool:
     return isinstance(payload, dict) and bool(payload) and "error" not in payload
+
+
+def gemini_web_key() -> str:
+    """Return the dedicated Gemini live-search key if set, else fall back to the main key."""
+    return st.session_state.get("gemini_web_api_key") or st.session_state.get("gemini_api_key", "")
+
 
 
 def merge_kpi_results(previous_kpis, new_kpis):
@@ -719,7 +738,7 @@ def sync_agent_executor(force: bool = False) -> None:
             active_filename=active_filename,
             live_search_provider=st.session_state.live_search_provider,
             openai_api_key=st.session_state.openai_api_key,
-            gemini_api_key=st.session_state.gemini_api_key,
+            gemini_api_key=gemini_web_key(),
             openai_web_model=st.session_state.openai_web_model,
             gemini_web_model=st.session_state.gemini_web_model,
         )
@@ -750,7 +769,7 @@ def submit_chat_question(question: str) -> None:
                 active_filename=st.session_state.get("active_file"),
                 live_search_provider=st.session_state.live_search_provider,
                 openai_api_key=st.session_state.openai_api_key,
-                gemini_api_key=st.session_state.gemini_api_key,
+                gemini_api_key=gemini_web_key(),
                 openai_web_model=st.session_state.openai_web_model,
                 gemini_web_model=st.session_state.gemini_web_model,
                 chat_history=st.session_state.chat_history[:-1],
@@ -868,14 +887,24 @@ with st.sidebar:
     st.session_state.openai_api_key = openai_key_input
 
     gemini_key_input = st.text_input(
-        label="Gemini API Key",
+        label="Gemini API Key (Answer Engine)",
         value=st.session_state.gemini_api_key,
         type="password",
-        placeholder="Gemini API key (optional)",
+        placeholder="Gemini key for answer generation",
         key="gemini_api_input",
         label_visibility="collapsed",
     )
     st.session_state.gemini_api_key = gemini_key_input
+
+    gemini_web_key_input = st.text_input(
+        label="Gemini API Key (Live Search)",
+        value=st.session_state.gemini_web_api_key,
+        type="password",
+        placeholder="2nd Gemini key for live search (diff account)",
+        key="gemini_web_api_input",
+        label_visibility="collapsed",
+    )
+    st.session_state.gemini_web_api_key = gemini_web_key_input
 
     if st.session_state.live_search_provider == "openai":
         if st.session_state.openai_api_key:
@@ -883,8 +912,11 @@ with st.sidebar:
         else:
             st.markdown('<div class="status-banner status-warning">⚠️ OpenAI selected, but API key is missing. Search will fall back to DuckDuckGo.</div>', unsafe_allow_html=True)
     elif st.session_state.live_search_provider == "gemini":
-        if st.session_state.gemini_api_key:
-            st.markdown('<div class="status-banner status-success">✅ Gemini live search ready</div>', unsafe_allow_html=True)
+        web_key = st.session_state.gemini_web_api_key or st.session_state.gemini_api_key
+        if web_key:
+            using_secondary = bool(st.session_state.gemini_web_api_key)
+            label = "✅ Gemini live search ready" + (" (secondary key)" if using_secondary else "")
+            st.markdown(f'<div class="status-banner status-success">{label}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="status-banner status-warning">⚠️ Gemini selected, but API key is missing. Search will fall back to DuckDuckGo.</div>', unsafe_allow_html=True)
     else:
@@ -920,7 +952,7 @@ with st.sidebar:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Upload PDF
+    # Upload PDF — Primary
     st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Upload Report</div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
         label="Upload Financial Report",
@@ -930,6 +962,66 @@ with st.sidebar:
         label_visibility="collapsed",
         help="Upload annual reports, earnings PDFs, 10-K/10-Q filings",
     )
+
+    # ── Competitor Reports ─────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.78rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">⚔️ Peer Compare — Upload Competitors</div>', unsafe_allow_html=True)
+    st.caption("Upload 1–2 competitor reports for head-to-head benchmarking")
+
+    comp1_file = st.file_uploader(
+        label="Competitor 1",
+        type=["pdf"],
+        key="comp1_upload",
+        label_visibility="visible",
+        help="Competitor report 1",
+    )
+    comp2_file = st.file_uploader(
+        label="Competitor 2",
+        type=["pdf"],
+        key="comp2_upload",
+        label_visibility="visible",
+        help="Competitor report 2 (optional)",
+    )
+
+    # Process competitor reports when uploaded
+    if comp1_file or comp2_file:
+        if st.button("⚔️ Load Competitors", use_container_width=True):
+            with st.spinner("Building competitor indexes…"):
+                new_peers = {}
+                new_peer_kpis = {}
+                for cf in [comp1_file, comp2_file]:
+                    if cf is None:
+                        continue
+                    try:
+                        fbytes = cf.getvalue()
+                        vs = build_peer_vectorstore(fbytes, cf.name)
+                        new_peers[cf.name] = vs
+                        # Quick KPI extraction
+                        if st.session_state.api_key:
+                            raw = extract_raw_text(fbytes, cf.name, max_pages=10)
+                            kpi_result = extract_kpis_with_llm(raw, st.session_state.api_key)
+                            new_peer_kpis[cf.name] = kpi_result
+                    except Exception as e:
+                        st.error(f"Failed to load {cf.name}: {e}")
+                st.session_state.peer_vectorstores = new_peers
+                st.session_state.peer_kpis = new_peer_kpis
+                st.session_state.peer_chat_history = []
+            st.success(f"✅ {len(new_peers)} competitor(s) loaded!")
+            st.rerun()
+
+    if st.session_state.peer_vectorstores:
+        peer_names = list(st.session_state.peer_vectorstores.keys())
+        st.markdown(
+            f'<div class="status-banner status-success">⚔️ Competitors loaded: ' +
+            ", ".join([f"<b>{n}</b>" for n in peer_names]) +
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("🗑️ Clear Competitors", use_container_width=True):
+            st.session_state.peer_vectorstores = {}
+            st.session_state.peer_kpis = {}
+            st.session_state.peer_chat_history = []
+            st.rerun()
 
     # Status / Polling Block
     if st.session_state.job_id:
@@ -1212,8 +1304,13 @@ else:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Tabs: Chat | Summary ───────────────────────────────────────────────
-    tab_chat, tab_summary = st.tabs(["💬  Analyst Chat", "📋  Executive Summary"])
+    # ── Tabs: Chat | Summary | Peer Compare ────────────────────────────────
+    has_peers = bool(st.session_state.peer_vectorstores)
+    if has_peers:
+        tab_chat, tab_summary, tab_peer = st.tabs(["💬  Analyst Chat", "📋  Executive Summary", "⚔️  Peer Compare"])
+    else:
+        tab_chat, tab_summary = st.tabs(["💬  Analyst Chat", "📋  Executive Summary"])
+        tab_peer = None
 
     # ── CHAT TAB ──────────────────────────────────────────────────────────
     with tab_chat:
@@ -1367,3 +1464,277 @@ else:
                     mime="text/markdown",
                     use_container_width=True,
                 )
+
+    # ── PEER COMPARE TAB ────────────────────────────────────────────────────
+    if tab_peer is not None:
+        with tab_peer:
+            st.markdown("""
+            <div class="section-header">
+                <div class="section-icon" style="background:rgba(139,92,246,0.15);color:#a78bfa;">⚔️</div>
+                <h2>Peer Benchmarking</h2>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── KPI Comparison Table ──────────────────────────────────────
+            all_kpis = {}
+            primary_kpis = st.session_state.kpis or {}
+            if isinstance(primary_kpis, dict) and "company_name" not in primary_kpis:
+                for fn, kd in primary_kpis.items():
+                    if isinstance(kd, dict) and "error" not in kd:
+                        all_kpis[kd.get("company_name", fn)] = kd
+                        break
+            elif isinstance(primary_kpis, dict) and "company_name" in primary_kpis:
+                all_kpis[primary_kpis.get("company_name", "Primary")] = primary_kpis
+
+            for fn, kd in st.session_state.peer_kpis.items():
+                if isinstance(kd, dict) and "error" not in kd:
+                    all_kpis[kd.get("company_name", fn.replace(".pdf", ""))] = kd
+
+            if len(all_kpis) >= 2:
+                kpi_rows = [
+                    ("💰 Revenue",       "revenue"),
+                    ("📊 EBITDA",         "ebitda"),
+                    ("📈 ROE",            "roe"),
+                    ("💧 Operating CF",   "operating_cash_flow"),
+                    ("📉 Total Debt",     "total_debt"),
+                    ("📐 D/E Ratio",      "debt_to_equity"),
+                    ("🎯 EPS",            "eps"),
+                    ("📦 Revenue Growth", "revenue_growth"),
+                ]
+                companies_list = list(all_kpis.keys())
+                th_cells = "".join([f'<th style="padding:10px 14px;text-align:right;color:#94a3b8;font-size:0.8rem;">{c}</th>' for c in companies_list])
+                table_html = f"""
+                <div style="overflow-x:auto;margin:16px 0;">
+                <table style="width:100%;border-collapse:collapse;background:rgba(15,23,42,0.6);border-radius:12px;overflow:hidden;">
+                <thead><tr style="border-bottom:1px solid #1e3a5f;">
+                    <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:0.78rem;text-transform:uppercase;">Metric</th>
+                    {th_cells}
+                </tr></thead><tbody>"""
+
+                for label, key in kpi_rows:
+                    vals = [format_kpi_value(all_kpis[c].get(key)) for c in companies_list]
+                    numeric_vals = []
+                    for v in vals:
+                        try:
+                            numeric_vals.append(float(str(v).replace("%","").replace("x","").replace(",","").replace("₹","").replace("Rs.","").split()[0]))
+                        except Exception:
+                            numeric_vals.append(None)
+                    best_idx = None
+                    if any(v is not None for v in numeric_vals):
+                        valid = [(i, v) for i, v in enumerate(numeric_vals) if v is not None]
+                        if key in ("total_debt", "debt_to_equity"):
+                            best_idx = min(valid, key=lambda x: x[1])[0]
+                        else:
+                            best_idx = max(valid, key=lambda x: x[1])[0]
+                    td_cells = ""
+                    for i, v in enumerate(vals):
+                        color = "#10b981" if i == best_idx else "#cbd5e1"
+                        weight = "700" if i == best_idx else "400"
+                        td_cells += f'<td style="padding:10px 14px;text-align:right;color:{color};font-weight:{weight};font-size:0.85rem;">{v}</td>'
+                    table_html += f'<tr style="border-bottom:1px solid rgba(30,58,95,0.5);"><td style="padding:10px 14px;color:#94a3b8;font-size:0.82rem;">{label}</td>{td_cells}</tr>'
+
+                table_html += "</tbody></table></div>"
+                st.markdown(table_html, unsafe_allow_html=True)
+                st.caption("🟢 Green = Best performer on that metric")
+            else:
+                st.info("Load at least 1 competitor report from the sidebar to enable benchmarking. KPIs for both companies will be compared here.")
+
+            st.markdown("---")
+
+            # ── Peer Chat ────────────────────────────────────────────────
+            st.markdown("""<div style="font-size:1rem;font-weight:600;color:#f0f9ff;margin-bottom:12px;">🤖 Ask Cross-Company Questions</div>""", unsafe_allow_html=True)
+
+            combined_vs = {}
+            if st.session_state.vectorstore:
+                primary_name = list(all_kpis.keys())[0] if all_kpis else "Primary"
+                combined_vs[primary_name] = st.session_state.vectorstore
+            combined_vs.update({
+                (st.session_state.peer_kpis.get(fn, {}).get("company_name") or fn.replace(".pdf", "")): vs
+                for fn, vs in st.session_state.peer_vectorstores.items()
+            })
+
+            peer_sample_qs = [
+                "Which company has the best EBITDA margin and why?",
+                "Compare debt profiles — who is financially stronger?",
+                "Which company is most exposed to commodity price risk?",
+                "Who has better revenue growth momentum?",
+            ]
+
+            if not st.session_state.peer_chat_history:
+                sq_cols = st.columns(2)
+                for i, q in enumerate(peer_sample_qs):
+                    with sq_cols[i % 2]:
+                        if st.button(q, key=f"peerq_{i}", use_container_width=True):
+                            st.session_state.peer_chat_history.append({"role": "user", "content": q})
+                            with st.spinner("Comparing across all reports..."):
+                                try:
+                                    ans = run_peer_comparison(
+                                        question=q, vectorstores=combined_vs,
+                                        groq_api_key=st.session_state.api_key,
+                                        answer_provider=st.session_state.answer_provider,
+                                        answer_model=st.session_state.selected_model,
+                                        openai_api_key=st.session_state.openai_api_key,
+                                        gemini_api_key=gemini_web_key(),
+                                        live_search_provider=st.session_state.live_search_provider,
+                                        chat_history=[],
+                                    )
+                                except Exception as e:
+                                    ans = f"Peer comparison failed: {e}"
+                            st.session_state.peer_chat_history.append({"role": "assistant", "content": ans})
+                            st.rerun()
+
+            if st.session_state.peer_chat_history:
+                peer_chat_html = '<div class="chat-container">'
+                for msg in st.session_state.peer_chat_history:
+                    if msg["role"] == "user":
+                        peer_chat_html += f'<div class="message-user"><div class="bubble-user">{msg["content"]}</div><div class="avatar-user">👤</div></div>'
+                    else:
+                        content = msg["content"].replace("\n", "<br>")
+                        peer_chat_html += f'<div class="message-ai"><div class="avatar-ai">🤖</div><div class="bubble-ai">{content}</div></div>'
+                peer_chat_html += "</div>"
+                st.markdown(peer_chat_html, unsafe_allow_html=True)
+                if st.button("🗑️ Clear Peer Chat", key="clear_peer_chat"):
+                    st.session_state.peer_chat_history = []
+                    st.rerun()
+
+            pc1, pc2 = st.columns([5, 1])
+            with pc1:
+                peer_q = st.text_input("Peer question", placeholder="e.g. Which company has lower debt risk going into FY27?", key="peer_q_input", label_visibility="collapsed")
+            with pc2:
+                peer_send = st.button("Ask", key="peer_send_btn", use_container_width=True)
+
+            if peer_send and peer_q.strip() and combined_vs:
+                st.session_state.peer_chat_history.append({"role": "user", "content": peer_q.strip()})
+                with st.spinner("Comparing across all reports..."):
+                    try:
+                        ans = run_peer_comparison(
+                            question=peer_q.strip(), vectorstores=combined_vs,
+                            groq_api_key=st.session_state.api_key,
+                            answer_provider=st.session_state.answer_provider,
+                            answer_model=st.session_state.selected_model,
+                            openai_api_key=st.session_state.openai_api_key,
+                            gemini_api_key=gemini_web_key(),
+                            live_search_provider=st.session_state.live_search_provider,
+                            chat_history=st.session_state.peer_chat_history[:-1],
+                        )
+                    except Exception as e:
+                        ans = f"Peer comparison failed: {str(e)}"
+                st.session_state.peer_chat_history.append({"role": "assistant", "content": ans})
+                st.rerun()
+
+# ── COMMODITY RADAR ──────────────────────────────────────────────────────
+st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("""
+<div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15);color:#fbbf24;">⚡</div>
+    <h2>Commodity Radar</h2>
+</div>
+""", unsafe_allow_html=True)
+
+alert_unit_map = {
+    "Lithium Carbonate": "$/tonne",
+    "Crude Oil (WTI)": "$/barrel",
+    "Natural Gas": "$/MMBtu",
+    "Copper": "$/tonne",
+    "INR/USD": "₹/USD",
+    "Coal": "$/tonne",
+}
+
+rad_col1, rad_col2 = st.columns([1, 2])
+
+with rad_col1:
+    st.markdown('<div style="font-size:0.85rem;font-weight:600;color:#f0f9ff;margin-bottom:10px;">🔔 Set New Alert</div>', unsafe_allow_html=True)
+    commodity_opts = list(COMMODITY_SEARCH_QUERIES.keys())
+    alert_commodity = st.selectbox("Commodity", commodity_opts, key="alert_commodity")
+    alert_direction = st.selectbox("Alert when price goes", ["Above", "Below"], key="alert_direction")
+    alert_threshold = st.number_input("Threshold", min_value=0.0, value=28000.0, step=100.0, key="alert_threshold")
+    unit = alert_unit_map.get(alert_commodity, "")
+    st.caption(f"Unit: {unit}")
+    if st.button("+ Add Alert", key="add_alert_btn", use_container_width=True):
+        st.session_state.commodity_alerts.append({
+            "commodity": alert_commodity, "direction": alert_direction,
+            "threshold": alert_threshold, "unit": unit, "triggered": False,
+        })
+        st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh Live Prices", key="refresh_commodities", use_container_width=True):
+        with st.spinner("Fetching live prices..."):
+            prices = {}
+            for comm in commodity_opts:
+                prices[comm] = fetch_commodity_live_price(
+                    comm,
+                    live_search_provider=st.session_state.live_search_provider,
+                    openai_api_key=st.session_state.openai_api_key,
+                    gemini_api_key=gemini_web_key(),
+                )
+        st.session_state.commodity_prices = prices
+        st.session_state.commodity_last_checked = time.strftime("%H:%M:%S")
+        st.rerun()
+
+with rad_col2:
+    st.markdown('<div style="font-size:0.85rem;font-weight:600;color:#f0f9ff;margin-bottom:10px;">📡 Live Tracker</div>', unsafe_allow_html=True)
+    if st.session_state.commodity_last_checked:
+        st.caption(f"Last checked: {st.session_state.commodity_last_checked}")
+    else:
+        st.caption("Click 'Refresh Live Prices' to fetch current market data.")
+
+    prices = st.session_state.commodity_prices
+    if prices:
+        for comm, pdata in prices.items():
+            price = pdata.get("price")
+            unit = alert_unit_map.get(comm, "")
+            alert_flag = ""
+            for alert in st.session_state.commodity_alerts:
+                if alert["commodity"] == comm and price is not None:
+                    trig = (alert["direction"] == "Above" and price > alert["threshold"]) or \
+                           (alert["direction"] == "Below" and price < alert["threshold"])
+                    if trig:
+                        alert_flag = " 🚨"
+                        alert["triggered"] = True
+            if price:
+                st.markdown(
+                    f'<div style="background:rgba(15,23,42,0.7);border:1px solid {"#ef4444" if alert_flag else "#1e3a5f"};border-radius:10px;padding:10px 14px;margin-bottom:8px;">'
+                    f'<span style="color:#fbbf24;font-weight:600;font-size:0.85rem;">{comm}</span>{alert_flag}'
+                    f'<span style="float:right;color:#f0f9ff;font-weight:700;">{unit} {price:,.1f}</span></div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f'<div style="background:rgba(15,23,42,0.4);border:1px solid #1e2a3f;border-radius:10px;padding:8px 14px;margin-bottom:6px;color:#475569;font-size:0.8rem;">{comm} — price unavailable</div>',
+                    unsafe_allow_html=True
+                )
+
+    if st.session_state.commodity_alerts:
+        st.markdown('<div style="font-size:0.85rem;font-weight:600;color:#f0f9ff;margin:16px 0 8px 0;">🔔 Active Alerts</div>', unsafe_allow_html=True)
+        to_remove = []
+        for i, alert in enumerate(st.session_state.commodity_alerts):
+            triggered = alert.get("triggered", False)
+            bc = "#ef4444" if triggered else "#1e3a5f"
+            bg = "rgba(239,68,68,0.08)" if triggered else "rgba(15,23,42,0.7)"
+            status = "🚨 TRIGGERED" if triggered else f"{alert['direction']} {alert['unit']}{alert['threshold']:,.0f}"
+            impact = ""
+            if triggered and "lithium" in alert["commodity"].lower():
+                impact = "<br><span style='color:#fbbf24;font-size:0.75rem;'>💡 Per sensitivity matrix: ~Rs.640 Cr EBITDA impact per $10K/tonne</span>"
+            st.markdown(
+                f'<div style="background:{bg};border:1px solid {bc};border-radius:10px;padding:10px 14px;margin-bottom:8px;">'
+                f'<b style="color:#94a3b8;">{alert["commodity"]}</b>'
+                f'<span style="float:right;color:#fbbf24;font-size:0.78rem;">{status}</span>{impact}</div>',
+                unsafe_allow_html=True
+            )
+            al1, al2, al3 = st.columns([3, 1, 1])
+            with al2:
+                if triggered:
+                    if st.button("📊 Analyze", key=f"analyze_{i}", use_container_width=True):
+                        p = st.session_state.commodity_prices.get(alert["commodity"], {}).get("price", "unknown")
+                        auto_q = f"{alert['commodity']} has crossed {alert['unit']}{alert['threshold']:,.0f} — current price ~{p}. What is the exact EBITDA impact and is FY27 guidance still achievable?"
+                        st.session_state.chat_history.append({"role": "user", "content": auto_q})
+                        st.rerun()
+            with al3:
+                if st.button("❌", key=f"rm_{i}", help="Remove alert"):
+                    to_remove.append(i)
+        for idx in reversed(to_remove):
+            st.session_state.commodity_alerts.pop(idx)
+        if to_remove:
+            st.rerun()
+

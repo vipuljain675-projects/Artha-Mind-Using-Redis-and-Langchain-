@@ -961,3 +961,175 @@ CONTENT:
             )
         raise exc
 
+
+# ── Peer Comparison Engine ──────────────────────────────────────────────────
+
+def run_peer_comparison(
+    question: str,
+    vectorstores: dict,          # {company_name: FAISS}
+    groq_api_key: str,
+    answer_provider: str = "groq",
+    answer_model: str = DEFAULT_GROQ_MODEL,
+    openai_api_key: str = "",
+    gemini_api_key: str = "",
+    openai_web_model: str = DEFAULT_OPENAI_WEB_MODEL,
+    gemini_web_model: str = DEFAULT_GEMINI_WEB_MODEL,
+    live_search_provider: str = "duckduckgo",
+    chat_history: Optional[list] = None,
+) -> str:
+    """
+    Search all peer vectorstores in parallel and synthesise a cross-company answer.
+    Uses smaller context per company to avoid LLM timeouts on 3-company comparisons.
+    Falls back to Groq if primary provider times out or hits quota.
+    """
+    CHARS_PER_COMPANY = 900   # tight cap so total prompt stays manageable
+
+    def _search_one(name_vs):
+        name, vs = name_vs
+        try:
+            results = vs.similarity_search(question, k=3)
+            context = " ".join([d.page_content for d in results])[:CHARS_PER_COMPANY]
+            return f"=== {name} ===\n{context}"
+        except Exception:
+            return f"=== {name} ===\n[Search failed]"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(vectorstores)) as pool:
+        contexts = list(pool.map(_search_one, vectorstores.items()))
+
+    combined_context = "\n\n".join(contexts)
+    conversation_context = _format_chat_history_for_prompt(chat_history)
+
+    # Live context — only fetch if truly needed, keep short
+    live_context = ""
+    if _question_needs_live_context(question):
+        try:
+            raw = run_live_web_search(
+                question,
+                provider=live_search_provider,
+                openai_api_key=openai_api_key,
+                gemini_api_key=gemini_api_key,
+                openai_model=openai_web_model,
+                gemini_model=gemini_web_model,
+            )
+            live_context = raw[:400]
+        except Exception:
+            pass
+
+    companies = ", ".join(vectorstores.keys())
+    prompt = f"""You are ArthaMind, a senior equity analyst. Compare {len(vectorstores)} companies: {companies}.
+
+QUESTION: {question}
+
+REPORT DATA:
+{combined_context}
+{f"LIVE CONTEXT: {live_context}" if live_context else ""}
+{f"PRIOR CHAT: {conversation_context}" if conversation_context.strip() else ""}
+
+RULES:
+- Use a markdown table for any numeric comparison
+- Cite the company name for each figure
+- End with a bold **PEER VERDICT:** (1-2 sentences, pick a winner and state why)
+"""
+
+    normalized = normalize_answer_provider(answer_provider)
+    effective_model = answer_model
+    if normalized == "groq":
+        effective_model, _ = resolve_llm_model(answer_model)
+
+    try:
+        return generate_text_with_provider(
+            provider=normalized,
+            prompt=prompt,
+            model=effective_model,
+            groq_api_key=groq_api_key,
+            openai_api_key=openai_api_key,
+            gemini_api_key=gemini_api_key,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        error_str = str(exc)
+        if normalized != "groq" and groq_api_key and any(
+            s in error_str for s in ("timed out", "timeout", "429", "503", "quota", "RESOURCE_EXHAUSTED")
+        ):
+            fallback_model, _ = resolve_llm_model(DEFAULT_GROQ_MODEL)
+            return (
+                "[Gemini timed out - Groq fallback used]\n\n"
+                + generate_text_with_provider(
+                    provider="groq",
+                    prompt=prompt,
+                    model=fallback_model,
+                    groq_api_key=groq_api_key,
+                    openai_api_key=openai_api_key,
+                    gemini_api_key=gemini_api_key,
+                    temperature=0.1,
+                )
+            )
+        raise exc
+
+
+# ── Commodity Radar ──────────────────────────────────────────────────────────
+
+COMMODITY_SEARCH_QUERIES = {
+    "Lithium Carbonate": "current lithium carbonate spot price per tonne USD 2025 2026",
+    "Crude Oil (WTI)":   "current WTI crude oil price per barrel USD today",
+    "Natural Gas":       "current natural gas price per MMBtu USD today",
+    "Copper":            "current copper price per tonne USD today LME",
+    "INR/USD":           "current Indian rupee USD exchange rate today",
+    "Coal":              "current thermal coal price per tonne USD today",
+}
+
+
+def fetch_commodity_live_price(
+    commodity: str,
+    live_search_provider: str = "duckduckgo",
+    openai_api_key: str = "",
+    gemini_api_key: str = "",
+    openai_web_model: str = DEFAULT_OPENAI_WEB_MODEL,
+    gemini_web_model: str = DEFAULT_GEMINI_WEB_MODEL,
+) -> dict:
+    """
+    Fetch the live price of a commodity via web search.
+    Returns {price: float, unit: str, direction: str, raw_text: str}
+    """
+    query = COMMODITY_SEARCH_QUERIES.get(commodity, f"current {commodity} price today USD")
+    try:
+        raw = run_live_web_search(
+            query,
+            provider=live_search_provider,
+            openai_api_key=openai_api_key,
+            gemini_api_key=gemini_api_key,
+            openai_model=openai_web_model,
+            gemini_model=gemini_web_model,
+        )
+        # Try to extract a number from the raw text
+        import re as _re
+        numbers = _re.findall(r'[\$₹]?\s*(\d[\d,]*\.?\d*)\s*(?:per\s+(?:tonne|barrel|MMBtu|ton))?', raw)
+        price = None
+        for n in numbers:
+            candidate = float(n.replace(",", ""))
+            # Filter out obviously wrong numbers (years, page numbers, etc.)
+            if commodity == "INR/USD" and 75 < candidate < 100:
+                price = candidate
+                break
+            elif "Oil" in commodity and 50 < candidate < 200:
+                price = candidate
+                break
+            elif "Lithium" in commodity and 5000 < candidate < 100000:
+                price = candidate
+                break
+            elif "Coal" in commodity and 50 < candidate < 500:
+                price = candidate
+                break
+            elif "Copper" in commodity and 5000 < candidate < 20000:
+                price = candidate
+                break
+            elif "Gas" in commodity and 0.5 < candidate < 30:
+                price = candidate
+                break
+        return {
+            "price": price,
+            "raw_text": raw[:500],
+            "error": None,
+        }
+    except Exception as exc:
+        return {"price": None, "raw_text": "", "error": str(exc)}
