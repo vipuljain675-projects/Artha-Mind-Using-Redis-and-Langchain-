@@ -12,8 +12,14 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import uuid
-from redis import Redis
-from rq import Queue
+
+# Redis/RQ are optional — app works without them (sync fallback)
+try:
+    from redis import Redis
+    from rq import Queue
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
 
 from ingest import extract_raw_text, load_vector_store, build_peer_vectorstore
 from chain import (
@@ -39,6 +45,13 @@ from utils import (
 )
 
 load_dotenv()
+
+def _secret(key: str, default: str = "") -> str:
+    """Read from st.secrets first (Streamlit Cloud), then os.getenv (local .env)."""
+    try:
+        return st.secrets.get(key, os.getenv(key, default))
+    except Exception:
+        return os.getenv(key, default)
 
 LIVE_SEARCH_OPTIONS = {
     "🌐 OpenAI Web Search": "openai",
@@ -591,15 +604,15 @@ def init_state():
         "summary": None,
         "processing": False,
         "job_id": None,
-        "api_key": os.getenv("GROQ_API_KEY", ""),
-        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-        "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
-        "gemini_web_api_key": os.getenv("GEMINI_WEB_API_KEY", ""),  # separate key for live search
+        "api_key": _secret("GROQ_API_KEY"),
+        "openai_api_key": _secret("OPENAI_API_KEY"),
+        "gemini_api_key": _secret("GEMINI_API_KEY"),
+        "gemini_web_api_key": _secret("GEMINI_WEB_API_KEY"),
         "answer_provider": default_answer_provider,
         "selected_model": get_default_model(default_answer_provider),
         "live_search_provider": default_live_provider,
-        "openai_web_model": os.getenv("OPENAI_WEB_SEARCH_MODEL", "gpt-4.1-mini"),
-        "gemini_web_model": os.getenv("GEMINI_WEB_SEARCH_MODEL", "gemini-2.5-flash"),
+        "openai_web_model": _secret("OPENAI_WEB_SEARCH_MODEL", "gpt-4.1-mini"),
+        "gemini_web_model": _secret("GEMINI_WEB_SEARCH_MODEL", "gemini-2.5-flash"),
         "active_tab": "chat",
         "active_file": None,
         "input_key": 0,
@@ -1023,22 +1036,22 @@ with st.sidebar:
             st.session_state.peer_chat_history = []
             st.rerun()
 
-    # Status / Polling Block
-    if st.session_state.job_id:
+    # Status / Polling Block (Redis async path)
+    if st.session_state.job_id and _REDIS_AVAILABLE:
         try:
-            r = Redis(host='localhost', port=6379)
+            r = Redis(host=_secret("REDIS_HOST", "localhost"), port=int(_secret("REDIS_PORT", "6379")),
+                      password=_secret("REDIS_PASSWORD") or None)
             q = Queue(connection=r)
             job = q.fetch_job(st.session_state.job_id)
 
             if job and not job.is_finished and not job.is_failed:
-                st.markdown(f'<div class="status-banner status-warning">⏳ Processing {job.kwargs.get("filename")} in background...</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="status-banner status-warning">⏳ Processing in background...</div>', unsafe_allow_html=True)
                 time.sleep(2)
                 st.rerun()
             elif job and job.is_failed:
                 st.markdown('<div class="status-banner status-error">❌ Background processing failed.</div>', unsafe_allow_html=True)
                 st.session_state.job_id = None
             elif job and job.is_finished:
-                # Job is done! Load results into session
                 result = job.result
                 if result.get("status") == "success":
                     st.session_state.doc_meta = {
@@ -1047,8 +1060,7 @@ with st.sidebar:
                         "total_chunks": result["total_chunks"]
                     }
                     merged_kpis, kpi_notice = merge_kpi_results(
-                        st.session_state.get("kpis"),
-                        result["kpis"],
+                        st.session_state.get("kpis"), result["kpis"],
                     )
                     merged_kpis, recovery_notice = recover_missing_kpis(merged_kpis)
                     st.session_state.kpis = merged_kpis
@@ -1056,55 +1068,99 @@ with st.sidebar:
                         [msg for msg in (kpi_notice, recovery_notice) if msg]
                     ) or None
                     st.session_state.vectorstore = load_vector_store("financial_index")
-                    
-                    # Init Agent with active_filename filter so FAISS only searches this document
                     first_file = result["filenames"][0] if result["filenames"] else None
                     st.session_state.active_file = first_file
                     sync_agent_executor(force=True)
                     st.session_state.chat_history = []
                     st.session_state.summary = None
                     st.session_state.job_id = None
-                    
-                    st.markdown('<div class="status-banner status-success">✅ Report processed successfully!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="status-banner status-success">✅ Report processed!</div>', unsafe_allow_html=True)
                     st.rerun()
                 else:
                     st.markdown(f'<div class="status-banner status-error">❌ {result.get("error")}</div>', unsafe_allow_html=True)
                     st.session_state.job_id = None
         except Exception as e:
-             st.markdown(f'<div class="status-banner status-error">⚠️ Redis Connection Error: {str(e)}</div>', unsafe_allow_html=True)
-             st.session_state.job_id = None
+            st.markdown(f'<div class="status-banner status-warning">Redis unavailable — switching to sync mode.</div>', unsafe_allow_html=True)
+            st.session_state.job_id = None
 
-    # Process button
+    # Process button — async (Redis) or sync fallback
     if uploaded_files and len(uploaded_files) > 0 and st.session_state.api_key and not st.session_state.job_id:
-        if st.button("🚀 Analyze Async", use_container_width=True):
-            with st.spinner("Queueing…"):
-                # Save uploaded files to temp disk
-                tmp_dir = os.path.join(os.path.dirname(__file__), "reports")
-                os.makedirs(tmp_dir, exist_ok=True)
-                file_payloads = []
-                for f in uploaded_files:
-                    persistent_path = os.path.join(tmp_dir, f.name)
-                    with open(persistent_path, "wb") as persistent_file:
-                        persistent_file.write(f.getbuffer())
-                    tmp_path = os.path.join(tmp_dir, f"{str(uuid.uuid4())}.pdf")
-                    with open(tmp_path, "wb") as w:
-                        w.write(f.getbuffer())
-                    file_payloads.append({"file_path": tmp_path, "filename": f.name})
-                    
-                # Enqueue the job
-                r = Redis(host='localhost', port=6379)
-                q = Queue(connection=r)
-                from worker import async_ingest_and_extract
-                job = q.enqueue(
-                    async_ingest_and_extract,
-                    files=file_payloads,
-                    api_key=st.session_state.api_key,
-                    job_timeout='10m'
-                )
-                
-                # Store job ID in session state so UI loop picks it up
-                st.session_state.job_id = job.id
-            st.rerun()
+        btn_label = "🚀 Analyze Async" if _REDIS_AVAILABLE else "🚀 Analyze"
+        if st.button(btn_label, use_container_width=True):
+            # Try Redis async first; fall back to inline sync
+            redis_ok = False
+            if _REDIS_AVAILABLE:
+                try:
+                    r = Redis(
+                        host=_secret("REDIS_HOST", "localhost"),
+                        port=int(_secret("REDIS_PORT", "6379")),
+                        password=_secret("REDIS_PASSWORD") or None,
+                        socket_connect_timeout=2,
+                    )
+                    r.ping()
+                    redis_ok = True
+                except Exception:
+                    pass
+
+            if redis_ok:
+                with st.spinner("Queueing…"):
+                    tmp_dir = os.path.join(os.path.dirname(__file__), "reports")
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    file_payloads = []
+                    for f in uploaded_files:
+                        persistent_path = os.path.join(tmp_dir, f.name)
+                        with open(persistent_path, "wb") as pf:
+                            pf.write(f.getbuffer())
+                        tmp_path = os.path.join(tmp_dir, f"{str(uuid.uuid4())}.pdf")
+                        with open(tmp_path, "wb") as w:
+                            w.write(f.getbuffer())
+                        file_payloads.append({"file_path": tmp_path, "filename": f.name})
+                    q = Queue(connection=r)
+                    from worker import async_ingest_and_extract
+                    job = q.enqueue(async_ingest_and_extract, files=file_payloads,
+                                    api_key=st.session_state.api_key, job_timeout='10m')
+                    st.session_state.job_id = job.id
+                st.rerun()
+            else:
+                # Sync fallback — runs ingest inline (works on Streamlit Cloud)
+                with st.spinner("Processing report… this may take 30-60 seconds"):
+                    try:
+                        from worker import async_ingest_and_extract
+                        import tempfile, os as _os
+                        tmp_dir = tempfile.mkdtemp()
+                        file_payloads = []
+                        for f in uploaded_files:
+                            tmp_path = _os.path.join(tmp_dir, f.name)
+                            with open(tmp_path, "wb") as w:
+                                w.write(f.getbuffer())
+                            file_payloads.append({"file_path": tmp_path, "filename": f.name})
+                        result = async_ingest_and_extract(files=file_payloads, api_key=st.session_state.api_key)
+                        if result.get("status") == "success":
+                            st.session_state.doc_meta = {
+                                "filenames": result["filenames"],
+                                "total_pages": result["total_pages"],
+                                "total_chunks": result["total_chunks"],
+                            }
+                            merged_kpis, kpi_notice = merge_kpi_results(
+                                st.session_state.get("kpis"), result["kpis"]
+                            )
+                            merged_kpis, recovery_notice = recover_missing_kpis(merged_kpis)
+                            st.session_state.kpis = merged_kpis
+                            st.session_state.kpi_notice = " ".join(
+                                [m for m in (kpi_notice, recovery_notice) if m]
+                            ) or None
+                            st.session_state.vectorstore = load_vector_store("financial_index")
+                            first_file = result["filenames"][0] if result["filenames"] else None
+                            st.session_state.active_file = first_file
+                            sync_agent_executor(force=True)
+                            st.session_state.chat_history = []
+                            st.session_state.summary = None
+                            st.markdown('<div class="status-banner status-success">✅ Report processed!</div>', unsafe_allow_html=True)
+                        else:
+                            st.error(f"Processing failed: {result.get('error')}")
+                    except Exception as exc:
+                        st.error(f"Processing error: {exc}")
+                st.rerun()
     elif uploaded_files and not st.session_state.api_key:
         st.markdown('<div class="status-banner status-warning">⚠️ Add the Groq KPI key first to build KPI cards and analyze the report.</div>', unsafe_allow_html=True)
 

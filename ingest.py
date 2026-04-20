@@ -14,7 +14,10 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-VECTOR_STORE_DIR = Path(__file__).parent / "vector_store"
+# Use /tmp on cloud (Streamlit Cloud, Render, etc.) — always writable
+# Use local ./vector_store when running locally
+_IS_CLOUD = os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STREAMLIT_SERVER_HEADLESS")
+VECTOR_STORE_DIR = Path("/tmp/arthamind_store") if _IS_CLOUD else Path(__file__).parent / "vector_store"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
