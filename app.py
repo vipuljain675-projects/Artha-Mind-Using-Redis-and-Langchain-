@@ -114,6 +114,26 @@ st.markdown("""
 [data-testid="stSidebar"] h2,
 [data-testid="stSidebar"] h3 { color: var(--text-primary) !important; }
 
+/* ── Sidebar toggle button — always visible ── */
+[data-testid="collapsedControl"] {
+    background: rgba(16,185,129,0.15) !important;
+    border: 1px solid rgba(16,185,129,0.4) !important;
+    border-radius: 0 8px 8px 0 !important;
+    color: #10b981 !important;
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="collapsedControl"] svg {
+    fill: #10b981 !important;
+    color: #10b981 !important;
+}
+/* Override any hide rules on the sidebar collapse button */
+section[data-testid="stSidebarCollapsedControl"] {
+    display: flex !important;
+    visibility: visible !important;
+}
+
 /* ── Hero Header ── */
 .arthamind-hero {
     background: linear-gradient(135deg, #0a1628 0%, #0f2744 50%, #0a1628 100%);
