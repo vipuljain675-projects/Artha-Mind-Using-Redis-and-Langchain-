@@ -47,15 +47,7 @@ from utils import (
 load_dotenv()
 
 def _secret(key: str, default: str = "") -> str:
-    """Read from st.secrets first (Streamlit Cloud), then os.getenv (local .env or Render)."""
-    # Streamlit throws a massive UI error if you even touch st.secrets without a file present.
-    # Check if the file exists before accessing to protect local runs and non-Streamlit clouds (Render)
-    secrets_paths = [".streamlit/secrets.toml", os.path.expanduser("~/.streamlit/secrets.toml")]
-    if any(os.path.isfile(p) for p in secrets_paths):
-        try:
-            return st.secrets.get(key, os.getenv(key, default))
-        except Exception:
-            pass
+    """Read from os.getenv (for local .env and Render deployment)."""
     return os.getenv(key, default)
 
 LIVE_SEARCH_OPTIONS = {
