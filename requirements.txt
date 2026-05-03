@@ -14,3 +14,5 @@ redis>=5.0.0
 rq>=1.15.0
 duckduckgo-search>=6.0.0
 yfinance>=0.2.0
+bcrypt>=4.1.0
+requests-oauthlib>=2.0.0

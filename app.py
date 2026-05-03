@@ -10,6 +10,7 @@ import json
 import traceback
 import streamlit as st
 from dotenv import load_dotenv
+import auth
 
 import uuid
 
@@ -658,6 +659,12 @@ def init_state():
 
 init_state()
 
+# ── Authentication Gate ───────────────────────────────────────────────────────
+if not auth.check_auth():
+    auth.login_ui()
+    st.stop()
+
+
 
 def is_valid_kpi_payload(payload) -> bool:
     return isinstance(payload, dict) and bool(payload) and "error" not in payload
@@ -839,6 +846,25 @@ def submit_chat_question(question: str) -> None:
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
+    # ── User Profile & Logout ──
+    user_initial = st.session_state.get('user_name', 'U')[0].upper()
+    user_name = st.session_state.get('user_name', 'Analyst')
+    st.markdown(f"""
+        <div style="display:flex;align-items:center;padding:12px;background:rgba(16,185,129,0.08);border-radius:12px;margin-bottom:12px;border:1px solid rgba(16,185,129,0.2);">
+            <div style="width:36px;height:36px;border-radius:50%;background:#10b981;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:1.2rem;margin-right:12px;flex-shrink:0;">
+                {user_initial}
+            </div>
+            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                <div style="font-weight:600;color:#f0f9ff;font-size:0.95rem;overflow:hidden;text-overflow:ellipsis;">{user_name}</div>
+                <div style="color:#34d399;font-size:0.75rem;">Verified Access</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    if st.button("Log Out", use_container_width=True, key="logout_btn"):
+        auth.logout()
+        
+    st.markdown("<hr style='margin: 15px 0; border-color: var(--border);'>", unsafe_allow_html=True)
+
     st.markdown("""
     <div style="text-align:center;padding:20px 0 16px 0;">
         <div style="font-size:2.5rem;margin-bottom:8px;">📊</div>
