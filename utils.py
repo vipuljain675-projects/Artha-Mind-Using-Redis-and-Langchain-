@@ -11,15 +11,28 @@ import time
 import random
 import functools
 
+from currency_utils import (
+    DEFAULT_DISPLAY_CURRENCY,
+    format_kpi_value as _format_kpi_value_with_currency,
+)
+
 
 
 # ── KPI Formatting ──────────────────────────────────────────────────────────────
 
-def format_kpi_value(value) -> str:
+def format_kpi_value(
+    value,
+    metric_key: str = "",
+    display_currency: str = DEFAULT_DISPLAY_CURRENCY,
+    source_currency_hint: str = "",
+) -> str:
     """Return a display-safe string for KPI values."""
-    if value is None or value == "null":
-        return "N/A"
-    return str(value)
+    return _format_kpi_value_with_currency(
+        value,
+        metric_key=metric_key,
+        display_currency=display_currency,
+        source_currency_hint=source_currency_hint,
+    )
 
 
 def retry_with_backoff(max_retries=3, initial_delay=1, backoff_factor=2, jitter=True):

@@ -7,10 +7,21 @@ import html
 import os
 import time
 import json
+import re
 import traceback
+from typing import Optional
 import streamlit as st
 from dotenv import load_dotenv
 import auth
+import report_generator
+import emailer
+from currency_utils import (
+    DEFAULT_DISPLAY_CURRENCY,
+    get_currency_options,
+    get_exchange_rate_status,
+    infer_kpi_currency_code,
+    refresh_exchange_rate_cache,
+)
 
 import uuid
 
@@ -633,6 +644,7 @@ def init_state():
         "gemini_web_model": _secret("GEMINI_WEB_SEARCH_MODEL", "gemini-2.5-flash"),
         "active_tab": "chat",
         "active_file": None,
+        "display_currency": DEFAULT_DISPLAY_CURRENCY,
         "input_key": 0,
         "agent_requested_model": None,
         "agent_active_file": None,
@@ -673,6 +685,29 @@ def is_valid_kpi_payload(payload) -> bool:
 def gemini_web_key() -> str:
     """Return the dedicated Gemini live-search key if set, else fall back to the main key."""
     return st.session_state.get("gemini_web_api_key") or st.session_state.get("gemini_api_key", "")
+
+
+def clear_generated_report_state():
+    for key in (
+        "generated_pdf_bytes",
+        "generated_pdf_company",
+        "generated_projections",
+        "generated_report_version",
+        "generated_report_currency",
+    ):
+        st.session_state.pop(key, None)
+
+
+def extract_first_numeric_value(value) -> Optional[float]:
+    if value in (None, "", "N/A"):
+        return None
+    match = re.search(r"-?\d[\d,]*\.?\d*", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 
@@ -1318,12 +1353,23 @@ else:
                 unsafe_allow_html=True,
             )
 
+        currency_options = get_currency_options()
+        currency_labels = list(currency_options.keys())
+        current_currency_code = st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY)
+        current_currency_label = next(
+            (label for label, code in currency_options.items() if code == current_currency_code),
+            currency_labels[0],
+        )
+
+        selector_col, currency_col, fx_col = st.columns([3.0, 1.4, 0.6])
+
         # Multi-document KPI dropdown logic
         if isinstance(st.session_state.kpis, dict) and not "company_name" in st.session_state.kpis:
             # It's a dict mapping filenames to KPIs
             available_files = list(st.session_state.kpis.keys())
             if available_files:
-                selected_file_for_kpi = st.selectbox("Select document KPIs to view:", available_files, key="kpi_selector")
+                with selector_col:
+                    selected_file_for_kpi = st.selectbox("Select document KPIs to view:", available_files, key="kpi_selector")
                 st.session_state.active_file = selected_file_for_kpi
                 sync_agent_executor()
                 kpis = st.session_state.kpis[selected_file_for_kpi]
@@ -1333,10 +1379,46 @@ else:
             kpis = st.session_state.kpis
             if st.session_state.agent_executor is None and st.session_state.vectorstore:
                 sync_agent_executor()
+            with selector_col:
+                st.markdown('<div style="height:28px;"></div>', unsafe_allow_html=True)
+
+        with currency_col:
+            chosen_currency_label = st.selectbox(
+                "Display currency",
+                options=currency_labels,
+                index=currency_labels.index(current_currency_label),
+                key="display_currency_select",
+            )
+        with fx_col:
+            st.markdown('<div style="height:28px;"></div>', unsafe_allow_html=True)
+            if st.button("↻ FX", use_container_width=True, key="refresh_fx_button"):
+                refresh_exchange_rate_cache(force_refresh=True)
+                clear_generated_report_state()
+                st.rerun()
+        st.session_state.display_currency = currency_options[chosen_currency_label]
+        selected_display_currency = st.session_state.display_currency
+        fx_status = get_exchange_rate_status()
+        if fx_status.get("live"):
+            date_bit = f" | latest date: {fx_status['date']}" if fx_status.get("date") else ""
+            st.caption(
+                "KPI cards, peer comparisons, and projection reports use this display currency. "
+                f"FX source: {fx_status.get('source', 'Unknown')}{date_bit}."
+            )
+        else:
+            st.caption(
+                "KPI cards, peer comparisons, and projection reports use this display currency. "
+                f"FX source fallback active: {fx_status.get('source', 'Unknown')}."
+            )
+            if fx_status.get("error"):
+                st.markdown(
+                    f'<div class="status-banner status-warning">⚠️ Live FX refresh failed, so ArthaMind is using fallback rates. Details: {html.escape(str(fx_status["error"])[:220])}</div>',
+                    unsafe_allow_html=True,
+                )
 
         if kpis and "error" not in kpis:
             company = kpis.get("company_name", "Company")
             period = kpis.get("report_period", "")
+            source_currency_hint = infer_kpi_currency_code(kpis)
 
             if company:
                 st.markdown(f"""
@@ -1346,19 +1428,24 @@ else:
 
             # KPI Cards
             kpi_items = [
-                ("💰 Gross Revenue", kpis.get("revenue"), kpis.get("revenue_growth")),
-                ("📊 Net Income", kpis.get("net_income"), kpis.get("net_margin")),
-                ("💼 EBITDA", kpis.get("ebitda"), None),
-                ("📈 EPS", kpis.get("eps"), None),
-                ("💧 Cash Flow", kpis.get("operating_cash_flow"), None),
-                ("🏦 Total Assets", kpis.get("total_assets"), None),
-                ("📉 Total Debt", kpis.get("total_debt"), kpis.get("debt_to_equity")),
-                ("💹 ROE", kpis.get("roe"), None),
+                ("revenue", "💰 Gross Revenue", kpis.get("revenue"), kpis.get("revenue_growth")),
+                ("net_income", "📊 Net Income", kpis.get("net_income"), kpis.get("net_margin")),
+                ("ebitda", "💼 EBITDA", kpis.get("ebitda"), None),
+                ("eps", "📈 EPS", kpis.get("eps"), None),
+                ("operating_cash_flow", "💧 Cash Flow", kpis.get("operating_cash_flow"), None),
+                ("total_assets", "🏦 Total Assets", kpis.get("total_assets"), None),
+                ("total_debt", "📉 Total Debt", kpis.get("total_debt"), kpis.get("debt_to_equity")),
+                ("roe", "💹 ROE", kpis.get("roe"), None),
             ]
 
             kpi_html = '<div class="kpi-grid">'
-            for label, value, delta in kpi_items:
-                val_str = format_kpi_value(value)
+            for metric_key, label, value, delta in kpi_items:
+                val_str = format_kpi_value(
+                    value,
+                    metric_key=metric_key,
+                    display_currency=selected_display_currency,
+                    source_currency_hint=source_currency_hint,
+                )
                 delta_html = ""
                 if delta and delta != "N/A" and delta != "null":
                     is_pos = "+" in str(delta) or (not str(delta).startswith("-"))
@@ -1403,12 +1490,12 @@ else:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Tabs: Chat | Summary | Peer Compare ────────────────────────────────
+    # ── Tabs: Chat | Summary | Peer Compare | Generate Report ──────────────
     has_peers = bool(st.session_state.peer_vectorstores)
     if has_peers:
-        tab_chat, tab_summary, tab_peer = st.tabs(["💬  Analyst Chat", "📋  Executive Summary", "⚔️  Peer Compare"])
+        tab_chat, tab_summary, tab_peer, tab_report = st.tabs(["💬  Analyst Chat", "📋  Executive Summary", "⚔️  Peer Compare", "📄  Generate Report"])
     else:
-        tab_chat, tab_summary = st.tabs(["💬  Analyst Chat", "📋  Executive Summary"])
+        tab_chat, tab_summary, tab_report = st.tabs(["💬  Analyst Chat", "📋  Executive Summary", "📄  Generate Report"])
         tab_peer = None
 
     # ── CHAT TAB ──────────────────────────────────────────────────────────
@@ -1611,13 +1698,18 @@ else:
                 </tr></thead><tbody>"""
 
                 for label, key in kpi_rows:
-                    vals = [format_kpi_value(all_kpis[c].get(key)) for c in companies_list]
+                    vals = [
+                        format_kpi_value(
+                            all_kpis[c].get(key),
+                            metric_key=key,
+                            display_currency=st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY),
+                            source_currency_hint=infer_kpi_currency_code(all_kpis[c]),
+                        )
+                        for c in companies_list
+                    ]
                     numeric_vals = []
                     for v in vals:
-                        try:
-                            numeric_vals.append(float(str(v).replace("%","").replace("x","").replace(",","").replace("₹","").replace("Rs.","").split()[0]))
-                        except Exception:
-                            numeric_vals.append(None)
+                        numeric_vals.append(extract_first_numeric_value(v))
                     best_idx = None
                     if any(v is not None for v in numeric_vals):
                         valid = [(i, v) for i, v in enumerate(numeric_vals) if v is not None]
@@ -1720,6 +1812,210 @@ else:
                         ans = f"Peer comparison failed: {str(e)}"
                 st.session_state.peer_chat_history.append({"role": "assistant", "content": ans})
                 st.rerun()
+
+    # ── GENERATE REPORT TAB ────────────────────────────────────────────────
+    with tab_report:
+        current_report_version = getattr(report_generator, "REPORT_PIPELINE_VERSION", "legacy")
+        stale_report_cleared = False
+        if (
+            st.session_state.get("generated_pdf_bytes")
+            and (
+                st.session_state.get("generated_report_version") != current_report_version
+                or st.session_state.get("generated_report_currency") != st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY)
+            )
+        ):
+            clear_generated_report_state()
+            stale_report_cleared = True
+
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-icon icon-green">📄</div>
+            <h2>Generate Projection Report</h2>
+        </div>
+        <p style="color:var(--text-secondary);margin-bottom:20px;">
+            Automatically generate a professional PDF projection report for the next fiscal year
+            based on this report's data. You can download it or email it directly to any address.
+        </p>
+        """, unsafe_allow_html=True)
+
+        raw_kpis = st.session_state.get("kpis")
+        doc_meta = st.session_state.get("doc_meta")
+        active_report_file = st.session_state.get("active_file")
+
+        if isinstance(raw_kpis, dict) and "company_name" not in raw_kpis:
+            if not active_report_file or active_report_file not in raw_kpis:
+                active_report_file = next(iter(raw_kpis), None)
+            kpis = raw_kpis.get(active_report_file, {}) if active_report_file else {}
+        else:
+            kpis = raw_kpis
+            if not active_report_file and doc_meta:
+                active_report_file = (doc_meta.get("filenames") or [None])[0]
+
+        if not kpis or "error" in kpis:
+            st.markdown("""
+            <div class="status-banner status-warning">
+                ⚠️ Please upload and analyze a report first (via the sidebar) before generating a projection.
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            company_name = kpis.get("company_name") or (doc_meta or {}).get("company", "Company")
+            report_period = kpis.get("report_period", "")
+
+            if stale_report_cleared:
+                st.info("An older cached projection PDF was cleared. Generate the report again to get the updated detailed format.")
+
+            col_form, col_info = st.columns([1.4, 1])
+
+            with col_form:
+                st.markdown("#### 🎯 Your Target Instructions")
+                if active_report_file or report_period:
+                    context_bits = [bit for bit in [active_report_file, report_period] if bit]
+                    st.caption(f"Projection source: {' | '.join(context_bits)}")
+                projection_currency = st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY)
+                st.caption(f"Projection output currency: {projection_currency}")
+                user_instructions = st.text_area(
+                    "Tell the AI what you want in the projection",
+                    placeholder=(
+                        "e.g. Target 30% revenue growth, expand jet engine exports to EU markets, "
+                        "increase R&D to 10% of revenue, achieve 70% domestic content by FY28..."
+                    ),
+                    height=130,
+                    key="report_instructions"
+                )
+
+                st.markdown("#### 📧 Email Delivery (optional)")
+                recipient_email = st.text_input(
+                    "Send to email address(es)",
+                    placeholder="ceo@company.com, investor@fund.com",
+                    key="report_email"
+                )
+                sender_note = st.text_input(
+                    "Personal note (optional)",
+                    placeholder="Please review the FY27 targets ahead of our board meeting",
+                    key="report_note"
+                )
+
+                gen_col, dl_col = st.columns([1, 1])
+                with gen_col:
+                    generate_btn = st.button("✨ Generate Report", use_container_width=True, key="gen_report_btn",
+                                             type="primary")
+
+            with col_info:
+                st.markdown("""
+                <div style="background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.2);
+                            border-radius:16px;padding:20px;margin-top:30px;">
+                    <div style="font-weight:700;color:#10b981;margin-bottom:10px;">What gets generated</div>
+                    <div style="color:#94a3b8;font-size:0.88rem;line-height:1.8;">
+                        📌 Cover page with company branding<br>
+                        📊 Financial projections (Revenue, EBITDA, PAT, R&D)<br>
+                        🎯 Key strategic targets<br>
+                        🏭 Segment-wise performance projections<br>
+                        ⚠️ Risk matrix with mitigations<br>
+                        🚀 Strategic priorities
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                sender_email = os.getenv("EMAIL_SENDER", "")
+                if not sender_email:
+                    st.markdown("""
+                    <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);
+                                border-radius:12px;padding:16px;margin-top:14px;">
+                        <div style="font-weight:600;color:#fbbf24;font-size:0.85rem;margin-bottom:6px;">
+                            ⚙️ Email Setup Required
+                        </div>
+                        <div style="color:#94a3b8;font-size:0.82rem;line-height:1.6;">
+                            Add to your <code>.env</code>:<br>
+                            <code>EMAIL_SENDER=you@gmail.com</code><br>
+                            <code>EMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx</code><br><br>
+                            Generate App Password at:<br>
+                            <a href="https://myaccount.google.com/apppasswords" target="_blank"
+                               style="color:#10b981;">myaccount.google.com/apppasswords</a>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ── Generate on button click ───────────────────────────────────
+            if generate_btn:
+                if not user_instructions.strip():
+                    st.warning("Please enter your target instructions so the AI knows what to project.")
+                else:
+                    clear_generated_report_state()
+                    with st.spinner("🤖 ArthaMind AI is generating your projection report..."):
+                        try:
+                            pdf_bytes, projections = report_generator.build_report(
+                                company_name=company_name,
+                                kpis=kpis,
+                                user_instructions=user_instructions,
+                                answer_provider=st.session_state.get("answer_provider", "groq"),
+                                api_key=st.session_state.get("api_key", ""),
+                                answer_model=st.session_state.get("selected_model", ""),
+                                openai_key=st.session_state.get("openai_api_key", ""),
+                                gemini_key=st.session_state.get("gemini_api_key", ""),
+                                vectorstore=st.session_state.get("vectorstore"),
+                                active_filename=active_report_file or "",
+                                preferred_currency_code=st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY),
+                            )
+                            st.session_state["generated_pdf_bytes"] = pdf_bytes
+                            st.session_state["generated_pdf_company"] = company_name
+                            st.session_state["generated_projections"] = projections
+                            st.session_state["generated_report_version"] = current_report_version
+                            st.session_state["generated_report_currency"] = st.session_state.get("display_currency", DEFAULT_DISPLAY_CURRENCY)
+                            st.success("✅ Report generated successfully!")
+                        except Exception as e:
+                            clear_generated_report_state()
+                            st.error(f"Report generation failed: {e}")
+
+            # ── Show results if PDF is generated ──────────────────────────
+            if st.session_state.get("generated_pdf_bytes"):
+                pdf_bytes = st.session_state["generated_pdf_bytes"]
+                proj_company = st.session_state.get("generated_pdf_company", company_name)
+                projections = st.session_state.get("generated_projections", {})
+
+                st.markdown("<hr style='margin:24px 0;border-color:var(--border);'>", unsafe_allow_html=True)
+
+                dl_col, email_col = st.columns([1, 1])
+                with dl_col:
+                    st.download_button(
+                        label="⬇️ Download PDF Report",
+                        data=pdf_bytes,
+                        file_name=f"{proj_company.replace(' ', '_')}_FY_Projection.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="download_pdf_btn"
+                    )
+
+                with email_col:
+                    if st.button("📧 Send via Email", use_container_width=True, key="send_email_btn"):
+                        if not recipient_email.strip():
+                            st.warning("Enter a recipient email address above.")
+                        else:
+                            from datetime import datetime
+                            fy_label = f"FY{datetime.now().year}-{str(datetime.now().year + 1)[-2:]}"
+                            with st.spinner(f"Sending to {recipient_email}..."):
+                                success, message = emailer.send_report_email(
+                                    to_email=recipient_email.strip(),
+                                    company_name=proj_company,
+                                    fy_label=fy_label,
+                                    pdf_bytes=pdf_bytes,
+                                    sender_note=sender_note
+                                )
+                            if success:
+                                st.success(message)
+                            else:
+                                st.error(message)
+
+                # Show projection summary
+                exec_summary = projections.get("executive_summary", "")
+                if exec_summary:
+                    st.markdown(f"""
+                    <div style="background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.15);
+                                border-radius:12px;padding:20px;margin-top:8px;">
+                        <div style="font-weight:700;color:#10b981;margin-bottom:8px;">AI Executive Summary</div>
+                        <div style="color:#94a3b8;font-size:0.92rem;line-height:1.7;">{exec_summary}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
 
 # ── COMMODITY RADAR ──────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
@@ -1836,4 +2132,3 @@ with rad_col2:
             st.session_state.commodity_alerts.pop(idx)
         if to_remove:
             st.rerun()
-
