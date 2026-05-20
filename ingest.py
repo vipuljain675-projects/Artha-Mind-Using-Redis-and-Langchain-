@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import re
+import shutil
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -66,7 +67,14 @@ def chunk_documents(docs: list, chunk_size: int = 600, chunk_overlap: int = 80) 
     return chunks
 
 
-def build_vector_store(chunks: list, store_name: str = "financial_index") -> FAISS:
+def delete_vector_store(store_name: str = "financial_index") -> None:
+    """Delete a persisted FAISS store so a fresh upload can replace stale context."""
+    store_path = VECTOR_STORE_DIR / store_name
+    if store_path.exists():
+        shutil.rmtree(store_path, ignore_errors=True)
+
+
+def build_vector_store(chunks: list, store_name: str = "financial_index", replace_existing: bool = False) -> FAISS:
     """
     Build or append to a FAISS vector store from document chunks.
     Saves to disk for reuse across sessions.
@@ -74,7 +82,11 @@ def build_vector_store(chunks: list, store_name: str = "financial_index") -> FAI
     VECTOR_STORE_DIR.mkdir(exist_ok=True)
     embeddings = get_embeddings()
 
-    existing_store = load_vector_store(store_name)
+    if replace_existing:
+        delete_vector_store(store_name)
+        existing_store = None
+    else:
+        existing_store = load_vector_store(store_name)
     if existing_store:
         existing_store.add_documents(chunks)
         vectorstore = existing_store
@@ -109,14 +121,14 @@ def load_vector_store(store_name: str = "financial_index") -> "FAISS":
         return None
 
 
-def process_pdf(file_bytes: bytes, filename: str, store_name: str = "financial_index") -> dict:
+def process_pdf(file_bytes: bytes, filename: str, store_name: str = "financial_index", replace_existing: bool = True) -> dict:
     """
     Full ingestion pipeline: PDF → Chunks → VectorStore.
     Returns metadata about the processed document.
     """
     docs = load_pdf(file_bytes, filename)
     chunks = chunk_documents(docs)
-    vectorstore = build_vector_store(chunks, store_name)
+    vectorstore = build_vector_store(chunks, store_name, replace_existing=replace_existing)
 
     # Gather raw text for KPI extraction (first 4000 chars = usually cover page + highlights)
     raw_text = "\n".join([d.page_content for d in docs[:8]])
@@ -145,4 +157,3 @@ def build_peer_vectorstore(file_bytes: bytes, filename: str) -> FAISS:
     chunks = chunk_documents(docs)
     embeddings = get_embeddings()
     return FAISS.from_documents(chunks, embeddings)
-

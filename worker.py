@@ -61,7 +61,7 @@ def async_ingest_and_extract(files: list, api_key: str) -> dict:
 
         # 5. Build/Append to vector DB using all chunks combined
         if all_chunks:
-            build_vector_store(all_chunks, store_name="financial_index")
+            build_vector_store(all_chunks, store_name="financial_index", replace_existing=True)
 
         return {
             "status": "success",

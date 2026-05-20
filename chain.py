@@ -902,6 +902,7 @@ def generate_summary(
     vectorstore: FAISS,
     api_key: str,
     company_name: str = "the company",
+    active_filename: str = None,
     answer_provider: str = "groq",
     model: str = DEFAULT_GROQ_MODEL,
     openai_api_key: str = "",
@@ -911,7 +912,10 @@ def generate_summary(
     from prompts import SUMMARY_PROMPT
 
     # Pull broad context from the vector store
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+    search_kwargs = {"k": 8}
+    if active_filename:
+        search_kwargs["filter"] = {"source_file": active_filename}
+    retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
     broad_docs = retriever.invoke("revenue profit income financial performance highlights risks outlook guidance")
     context = "\n\n".join([d.page_content for d in broad_docs])
 

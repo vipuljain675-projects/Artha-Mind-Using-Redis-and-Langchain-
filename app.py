@@ -1593,11 +1593,13 @@ else:
             """, unsafe_allow_html=True)
             if st.button("📝 Generate Executive Summary", use_container_width=True):
                 with st.spinner("Drafting executive summary…"):
-                    # Ensure company name is safely fetched from multi-document dict
+                    active_summary_file = st.session_state.get("active_file")
                     active_company = "the company"
                     if isinstance(st.session_state.kpis, dict):
                         if "company_name" in st.session_state.kpis:
                             active_company = st.session_state.kpis.get("company_name", "the company")
+                        elif active_summary_file and isinstance(st.session_state.kpis.get(active_summary_file), dict):
+                            active_company = st.session_state.kpis[active_summary_file].get("company_name", "the company")
                         elif list(st.session_state.kpis.values()):
                             active_company = list(st.session_state.kpis.values())[0].get("company_name", "the company")
 
@@ -1606,6 +1608,7 @@ else:
                             st.session_state.vectorstore,
                             st.session_state.api_key,
                             company_name=active_company,
+                            active_filename=active_summary_file,
                             answer_provider=st.session_state.answer_provider,
                             model=st.session_state.selected_model,
                             openai_api_key=st.session_state.openai_api_key,
